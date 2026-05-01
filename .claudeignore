@@ -1,0 +1,30 @@
+node_modules/
+**/node_modules/
+
+# Build output
+dist/
+**/dist/
+build/
+
+# Python venv + cache
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Local data
+backend/data/uploads/
+backend/data/indexes/
+
+# Lockfiles (large, rarely useful to read)
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+uv.lock
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Node
+node_modules/
+dist/
+
+# Editor
+.vscode/
+.idea/
+
+# Project data
+backend/data/uploads/*
+backend/data/indexes/*
+!backend/data/uploads/.gitkeep
+!backend/data/indexes/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
