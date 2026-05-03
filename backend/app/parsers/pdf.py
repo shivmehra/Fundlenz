@@ -1,3 +1,4 @@
+import csv
 import re
 from pathlib import Path
 
@@ -48,21 +49,51 @@ def parse_pdf(path: Path) -> list[dict]:
     """
     with pdfplumber.open(path) as pdf:
         per_page_text: list[str] = []
-        per_page_tables: list[list[str]] = []
+        per_page_tables: list[list[list[str]]] = []
         for page in pdf.pages:
             tables = _extract_validated_tables(page)
-            per_page_tables.append([_table_to_markdown(t) for t in tables])
+            per_page_tables.append(tables)
             per_page_text.append(page.extract_text() or "")
 
         boilerplate = _detect_boilerplate(per_page_text)
         records: list[dict] = []
-        for i, (raw_text, tables_md) in enumerate(
+        for i, (raw_text, tables) in enumerate(
             zip(per_page_text, per_page_tables), start=1
         ):
             text = _strip_boilerplate(raw_text, boilerplate)
             text = normalize(text)
-            records.append({"page": i, "text": text, "tables_md": tables_md})
+            tables_md = [_table_to_markdown(t) for t in tables]
+            records.append({"page": i, "text": text, "tables_md": tables_md, "tables": tables})
     return records
+
+
+def extract_pdf_tables_as_csv(pdf_path: Path, output_dir: Path | None = None) -> list[Path]:
+    """Extract all tables from a PDF and save each as a CSV file.
+
+    Returns list of generated CSV file paths. If output_dir is None, uses
+    the same directory as the PDF. CSV filenames follow the pattern:
+    {pdf_name}_page{N}_table{M}.csv
+    """
+    if output_dir is None:
+        output_dir = pdf_path.parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    records = parse_pdf(pdf_path)
+    csv_paths: list[Path] = []
+    base_name = pdf_path.stem
+
+    for page_num, record in enumerate(records, start=1):
+        tables = record.get("tables", [])
+        for table_idx, table in enumerate(tables, start=1):
+            csv_name = f"{base_name}_page{page_num}_table{table_idx}.csv"
+            csv_path = output_dir / csv_name
+
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerows(table)
+            csv_paths.append(csv_path)
+
+    return csv_paths
 
 
 def _extract_validated_tables(page) -> list[list[list[str]]]:

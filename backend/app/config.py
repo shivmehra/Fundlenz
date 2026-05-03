@@ -23,6 +23,15 @@ class Settings(BaseSettings):
     # a pandas filter via query_table is faster and exact than FAISS L2.
     enable_numeric_ann: bool = False
 
+    # Cross-encoder reranker (second stage, after the deterministic linear
+    # rerank). Adds ~80ms p50 per query but cleans up the semantic tier so the
+    # LLM sees fewer distractor rows in the context.
+    enable_cross_encoder: bool = True
+    cross_encoder_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    # How many candidates to score with the cross-encoder. Larger = better
+    # recall, more CE compute. Bounded by the linear rerank's over-fetch.
+    ce_top_n: int = 20
+
     @property
     def index_dir(self) -> Path:
         return self.data_dir / "indexes"

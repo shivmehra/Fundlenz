@@ -1,9 +1,10 @@
-import type { ChartPayload, Source } from "../types";
+import type { ChartPayload, Confidence, Source } from "../types";
 
 export interface StreamHandlers {
   onSources: (s: Source[]) => void;
   onToken: (t: string) => void;
   onChart: (c: ChartPayload) => void;
+  onConfidence: (c: Confidence) => void;
   onDone: () => void;
   onError: (err: unknown) => void;
 }
@@ -80,6 +81,7 @@ export async function streamChat(
           case "sources": h.onSources(JSON.parse(ev.data)); break;
           case "token": h.onToken(ev.data); break;
           case "chart": h.onChart(JSON.parse(ev.data)); break;
+          case "confidence": h.onConfidence(JSON.parse(ev.data)); break;
           case "done": h.onDone(); return;
         }
       }

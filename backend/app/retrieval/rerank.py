@@ -30,8 +30,10 @@ def deterministic_score(
 ) -> float:
     """Linear combination of signals. Coefficients are intentionally not
     learned — this is a deterministic rerank that the user can reason about
-    and the test suite can pin. A cross-encoder can replace the text_sim
-    coefficient slot in a future iteration."""
+    and the test suite can pin. A cross-encoder runs on top of this output
+    (see `retrieval/cross_encoder.py`); it re-orders the semantic tier without
+    affecting the exact-id ordering, so this scoring formula stays the
+    determinism contract."""
     score = 0.0
     if exact_id:
         score += 1.00

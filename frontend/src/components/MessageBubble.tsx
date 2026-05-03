@@ -1,6 +1,6 @@
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { MatchKind, Message } from "../types";
+import type { ConfidenceTier, MatchKind, Message } from "../types";
 import PlotlyChart from "./PlotlyChart";
 
 const MATCH_LABELS: Record<MatchKind, string> = {
@@ -9,10 +9,30 @@ const MATCH_LABELS: Record<MatchKind, string> = {
   semantic: "semantic",
 };
 
+const TIER_LABELS: Record<ConfidenceTier, string> = {
+  deterministic: "Verified",
+  grounded: "Grounded",
+  semantic: "Generated",
+};
+
 export default function MessageBubble({ msg }: { msg: Message }) {
   const empty = !msg.content;
   return (
     <div className={`bubble ${msg.role}`}>
+      {msg.confidence && (
+        <div
+          className={`answer-confidence answer-confidence-${msg.confidence.tier}`}
+          title={msg.confidence.reason}
+        >
+          <span className="answer-confidence-label">
+            {TIER_LABELS[msg.confidence.tier]}
+          </span>
+          <span className="answer-confidence-pct">
+            {Math.round(Math.max(0, Math.min(1, msg.confidence.value)) * 100)}%
+          </span>
+          <span className="answer-confidence-reason">{msg.confidence.reason}</span>
+        </div>
+      )}
       <div className="bubble-content">
         {empty ? (
           msg.role === "assistant" ? "…" : ""

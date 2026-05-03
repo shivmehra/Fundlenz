@@ -55,6 +55,7 @@ export default function ChatWindow({ sessionId, onUploaded }: Props) {
         onSources: (sources) => updateLast((m) => ({ ...m, sources })),
         onToken: (tok) => updateLast((m) => ({ ...m, content: m.content + tok })),
         onChart: (chart) => updateLast((m) => ({ ...m, chart })),
+        onConfidence: (confidence) => updateLast((m) => ({ ...m, confidence })),
         onDone: () => setBusy(false),
         onError: (err) => {
           updateLast((m) => ({ ...m, content: m.content + `\n[error: ${String(err)}]` }));

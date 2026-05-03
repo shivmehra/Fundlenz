@@ -4,6 +4,7 @@ import shutil
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
+import pandas as pd
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -11,13 +12,16 @@ from sse_starlette.sse import EventSourceResponse
 
 from app import state
 from app.analysis.charts import chart_spec
+from app.analysis.column_match import resolve_column
 from app.analysis.metrics import compute
 from app.analysis.query import query_table
 from app.config import settings
 from app.ingest import ingest_file
 from app.llm.ollama_client import build_messages, rewrite_query, stream_chat
 from app.llm.tools import TOOL_COMPUTE_METRIC, TOOL_QUERY_TABLE, TOOLS
+from app.parsers.pdf import extract_pdf_tables_as_csv
 from app.retrieval.orchestrator import format_context_v2, retrieve_v2
+from app.retrieval.router import classify_intent
 
 
 # Aggregation-leaning words that should expose compute_metric.
@@ -133,7 +137,21 @@ async def ingest(file: UploadFile = File(...)) -> dict:
     with dest.open("wb") as f:
         shutil.copyfileobj(file.file, f)
     try:
-        return await asyncio.to_thread(ingest_file, dest, file.filename)
+        result = await asyncio.to_thread(ingest_file, dest, file.filename)
+
+        # If it's a PDF, also extract and ingest any tables as CSV.
+        if dest.suffix.lower() == ".pdf":
+            try:
+                csv_paths = await asyncio.to_thread(
+                    extract_pdf_tables_as_csv, dest, settings.upload_dir
+                )
+                for csv_path in csv_paths:
+                    await asyncio.to_thread(ingest_file, csv_path, csv_path.name)
+            except Exception as e:
+                # Table extraction failure is not fatal; log but don't fail.
+                print(f"Warning: PDF table extraction failed for {file.filename}: {e}")
+
+        return result
     except ValueError as e:
         raise HTTPException(400, str(e))
 
@@ -150,8 +168,22 @@ async def chat(req: ChatRequest):
     # Fold prior turns into the retrieval query so follow-ups like "what is its NAV?"
     # find the entity from earlier turns. Generation still sees the original message.
     search_query = await rewrite_query(req.message, history)
+    # Classify intent on the LITERAL message (req.message), not the rewritten one.
+    # The rewriter can hijack broad-intent queries — e.g. "List all benchmarks"
+    # → "List benchmarks of HDFC Top 100" — flipping list_distinct to
+    # point_lookup and surfacing entity chunks instead of the enumeration chunk.
+    # Entity phrases from the rewritten query are merged in so coreference
+    # resolution ("its NAV") still works for queries that genuinely need it.
+    plan = classify_intent(req.message)
+    if search_query != req.message:
+        rewritten_plan = classify_intent(search_query)
+        seen = set(plan.raw_entity_phrases)
+        for phrase in rewritten_plan.raw_entity_phrases:
+            if phrase not in seen:
+                plan.raw_entity_phrases.append(phrase)
+                seen.add(phrase)
     chunks = await asyncio.to_thread(
-        retrieve_v2, search_query, state.composite, settings.top_k
+        retrieve_v2, search_query, state.composite, settings.top_k, plan
     )
     context = format_context_v2(chunks)
     sources = [_source_card(c) for c in chunks]
@@ -174,12 +206,40 @@ async def chat(req: ChatRequest):
             )
             state.chat_history[req.session_id].append({"role": "user", "content": req.message})
             state.chat_history[req.session_id].append({"role": "assistant", "content": msg})
+            conf = {"tier": "semantic", "value": 0.0, "reason": "no tabular file uploaded"}
+            yield {"event": "confidence", "data": json.dumps(conf)}
             yield {"event": "token", "data": msg}
             yield {"event": "done", "data": ""}
             return
 
+        # Numeric-threshold deterministic bypass. The router already extracts
+        # `(op, value)` from the query — pair it with a column resolved from the
+        # query phrase and we can run pandas filtering directly. This avoids the
+        # 7B-class model's well-documented unreliability on numeric comparisons.
+        # Run on req.message (literal user text), not search_query: rewrite_query
+        # can rephrase "less than 100" into a form the threshold regex misses.
+        if req.mode != "chat":
+            bypass = _try_numeric_threshold_bypass(req.message)
+            if bypass is not None:
+                full_answer, _, column, op, value, n_rows, n_files = bypass
+                if n_files > 1:
+                    reason = (
+                        f"pandas filter on {column} {op} {value} "
+                        f"across {n_files} file(s)"
+                    )
+                else:
+                    reason = f"pandas filter on {column} {op} {value}"
+                conf = {"tier": "deterministic", "value": 1.0, "reason": reason}
+                yield {"event": "confidence", "data": json.dumps(conf)}
+                yield {"event": "token", "data": full_answer}
+                state.chat_history[req.session_id].append({"role": "user", "content": req.message})
+                state.chat_history[req.session_id].append({"role": "assistant", "content": full_answer})
+                yield {"event": "done", "data": ""}
+                return
+
         full_answer: str = ""
         tool_call: dict | None = None
+        tool_executed = False
 
         tools = _select_tools(req.message, req.mode)
 
@@ -201,6 +261,7 @@ async def chat(req: ChatRequest):
                 payload = await asyncio.to_thread(_run_compute_metric, tool_call["arguments"])
                 yield {"event": "chart", "data": json.dumps(payload)}
                 full_answer = payload["text"]
+                tool_executed = True
                 yield {"event": "token", "data": full_answer}
             except Exception as e:
                 err = f"Could not compute metric: {e}"
@@ -209,17 +270,151 @@ async def chat(req: ChatRequest):
         elif tool_call and tool_call["name"] == "query_table":
             try:
                 full_answer = await asyncio.to_thread(_run_query_table, tool_call["arguments"])
+                tool_executed = True
                 yield {"event": "token", "data": full_answer}
             except Exception as e:
                 err = f"Could not query table: {e}"
                 full_answer = err
                 yield {"event": "token", "data": err}
 
+        conf = _confidence_for_llm_path(chunks, tool_executed=tool_executed)
+        yield {"event": "confidence", "data": json.dumps(conf)}
+
         state.chat_history[req.session_id].append({"role": "user", "content": req.message})
         state.chat_history[req.session_id].append({"role": "assistant", "content": full_answer})
         yield {"event": "done", "data": ""}
 
     return EventSourceResponse(event_stream())
+
+
+def _try_numeric_threshold_bypass(
+    query: str,
+) -> tuple[str, str, str, str, float, int, int] | None:
+    """Run a deterministic pandas filter when the query is a numeric-threshold
+    question (e.g. "Funds with AUM > 50000"). Returns
+    (answer_md, primary_filename, primary_column, op, value, n_rows, n_files)
+    on success, or None to fall through to the LLM path.
+
+    Aggregates across every loaded tabular file whose schema contains a column
+    matching the query phrase — funds in different uploads should all show up
+    in the result. `primary_filename` / `primary_column` reference the first
+    contributing file (used only for telemetry / the confidence reason).
+
+    Falls through when:
+      - intent is not numeric_threshold
+      - no tabular file is loaded
+      - no column in any loaded file matches the query phrase
+    """
+    plan = classify_intent(query)
+    if plan.intent != "numeric_threshold" or plan.threshold is None:
+        return None
+    if not state.filename_to_file_id:
+        return None
+
+    op, value = plan.threshold
+
+    # Every file with a token-overlapping numeric column joins the search.
+    matched: list[tuple[str, str, pd.DataFrame]] = []
+    for filename, file_id in state.filename_to_file_id.items():
+        df = state.dataframes_by_file_id.get(file_id)
+        if df is None:
+            continue
+        col, score = resolve_column(query, df)
+        if col and score > 0:
+            matched.append((filename, col, df))
+    if not matched:
+        return None
+
+    per_file: list[tuple[str, str, pd.DataFrame]] = []
+    for filename, column, df in matched:
+        result = query_table(
+            df,
+            filters=[{"column": column, "op": op, "value": value}],
+            limit=50,
+        )
+        per_file.append((filename, column, result))
+
+    contributing = [(fn, col, r) for fn, col, r in per_file if not r.empty]
+    total_rows = sum(len(r) for _, _, r in per_file)
+    n_files_searched = len(per_file)
+
+    if total_rows == 0:
+        files_searched = ", ".join(f"`{fn}`" for fn, _, _ in per_file)
+        cols_unique = sorted({col for _, col, _ in per_file})
+        cols_label = ", ".join(f"`{c}`" for c in cols_unique)
+        msg = (
+            f"No rows match {cols_label} {op} {value} across "
+            f"{n_files_searched} file(s): {files_searched}. "
+            f"(Filter applied directly via pandas — no LLM inference involved.)"
+        )
+        return msg, per_file[0][0], per_file[0][1], op, float(value), 0, n_files_searched
+
+    if len(contributing) == 1:
+        filename, column, result = contributing[0]
+        summary = (
+            f"{len(result)} row(s) in `{filename}` where "
+            f"`{column}` {op} {value} (filter applied directly via pandas)."
+        )
+        return (
+            f"{summary}\n\n{result.to_markdown(index=False)}",
+            filename, column, op, float(value), len(result), 1,
+        )
+
+    pieces = []
+    for filename, _, result in contributing:
+        tagged = result.copy()
+        tagged.insert(0, "Source File", filename)
+        pieces.append(tagged)
+    combined = pd.concat(pieces, ignore_index=True)
+    cols_unique = sorted({col for _, col, _ in contributing})
+    cols_label = ", ".join(f"`{c}`" for c in cols_unique)
+    breakdown = ", ".join(f"`{fn}` ({len(r)})" for fn, _, r in contributing)
+    summary = (
+        f"{total_rows} row(s) where {cols_label} {op} {value} across "
+        f"{len(contributing)} file(s): {breakdown}."
+    )
+    return (
+        f"{summary}\n\n{combined.to_markdown(index=False)}",
+        contributing[0][0], contributing[0][1], op, float(value),
+        total_rows, len(contributing),
+    )
+
+
+def _confidence_for_llm_path(chunks: list, *, tool_executed: bool) -> dict:
+    """Determinism tier for the answer. `deterministic` when a tool ran or all
+    top sources are exact-id matches; `grounded` when retrieval scored ≥ 0.85
+    on average; `semantic` otherwise."""
+    if tool_executed:
+        return {
+            "tier": "deterministic",
+            "value": 1.0,
+            "reason": "deterministic tool execution",
+        }
+    if not chunks:
+        return {"tier": "semantic", "value": 0.0, "reason": "no relevant sources"}
+
+    top = chunks[:3]
+    if all((c.get("_score_breakdown") or {}).get("exact_id") for c in top):
+        return {
+            "tier": "deterministic",
+            "value": 1.0,
+            "reason": "all top sources are exact entity matches",
+        }
+
+    # Average displayed source score (the same 0–1 number the source cards show).
+    scores = [_source_card(c)["score"] for c in top]
+    avg = sum(scores) / len(scores)
+    if avg >= 0.85:
+        return {
+            "tier": "grounded",
+            "value": round(avg, 3),
+            "reason": f"strong source overlap (avg {round(avg * 100)}%)",
+        }
+    return {
+        "tier": "semantic",
+        "value": round(avg, 3),
+        "reason": f"semantic-only retrieval (avg {round(avg * 100)}%)",
+    }
 
 
 def _source_card(c: dict) -> dict:

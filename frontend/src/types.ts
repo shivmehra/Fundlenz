@@ -17,9 +17,18 @@ export interface ChartPayload {
   chart_spec: { data: unknown[]; layout: Record<string, unknown> };
 }
 
+export type ConfidenceTier = "deterministic" | "grounded" | "semantic";
+
+export interface Confidence {
+  tier: ConfidenceTier;
+  value: number;       // 0-1
+  reason: string;      // human-readable explanation
+}
+
 export interface Message {
   role: Role;
   content: string;
   sources?: Source[];
   chart?: ChartPayload;
+  confidence?: Confidence;
 }
