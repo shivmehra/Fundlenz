@@ -3,11 +3,15 @@ from typing import Deque
 
 import pandas as pd
 
-from app.rag.vector_store import VectorStore
 from app.config import settings
+from app.index.composite import CompositeIndex
 
 
-vector_store = VectorStore(settings.index_dir)
+composite = CompositeIndex(
+    settings.index_dir,
+    text_dim=384,
+    enable_numeric_ann=settings.enable_numeric_ann,
+)
 # load_or_init() is called in the FastAPI lifespan (main.py) so startup errors surface clearly.
 
 dataframes_by_file_id: dict[str, pd.DataFrame] = {}

@@ -17,7 +17,7 @@ from app.config import settings
 from app.ingest import ingest_file
 from app.llm.ollama_client import build_messages, rewrite_query, stream_chat
 from app.llm.tools import TOOL_COMPUTE_METRIC, TOOL_QUERY_TABLE, TOOLS
-from app.rag.retriever import format_context, retrieve
+from app.retrieval.orchestrator import format_context_v2, retrieve_v2
 
 
 # Aggregation-leaning words that should expose compute_metric.
@@ -76,8 +76,8 @@ def _select_tools(message: str, mode: str) -> list | None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # Run in a thread — faiss.read_index is blocking file I/O.
-    await asyncio.to_thread(state.vector_store.load_or_init)
+    # Run in a thread — faiss.read_index + sqlite open are blocking I/O.
+    await asyncio.to_thread(state.composite.load_or_init)
     yield
 
 
@@ -94,32 +94,35 @@ app.add_middleware(
 
 @app.get("/health")
 def health() -> dict:
+    stats = state.composite.stats()
     return {
         "status": "ok",
-        "indexed_chunks": state.vector_store.index.ntotal if state.vector_store.index else 0,
+        "indexed_chunks": stats["text_chunks"],
+        "by_type": stats["by_type"],
+        "inverted_postings": stats["inverted_postings"],
         "tabular_files": list(state.filename_to_file_id.keys()),
+        "files": stats["files"],
+        "enable_numeric_ann": stats["enable_numeric_ann"],
     }
 
 
 @app.get("/documents")
 def list_documents() -> list[dict]:
-    return [
-        {"filename": fn, **state.documents.get(fn, {})}
-        for fn in state.vector_store.list_filenames()
-    ]
+    files = state.composite.meta.list_files()
+    return [{"filename": fn, **state.documents.get(fn, {})} for fn in files]
 
 
 @app.delete("/documents/{filename}")
 async def delete_document(filename: str) -> dict:
-    deleted = await asyncio.to_thread(state.vector_store.delete_by_filename, filename)
+    deleted = await asyncio.to_thread(state.composite.delete_by_file, filename)
     if not deleted:
         raise HTTPException(404, f"No document named '{filename}' in the index.")
-    await asyncio.to_thread(state.vector_store.save)
+    await asyncio.to_thread(state.composite.save)
     state.documents.pop(filename, None)
     file_id = state.filename_to_file_id.pop(filename, None)
     if file_id:
         state.dataframes_by_file_id.pop(file_id, None)
-    return {"deleted": filename}
+    return {"deleted": filename, "chunks_removed": deleted}
 
 
 @app.post("/ingest")
@@ -147,12 +150,11 @@ async def chat(req: ChatRequest):
     # Fold prior turns into the retrieval query so follow-ups like "what is its NAV?"
     # find the entity from earlier turns. Generation still sees the original message.
     search_query = await rewrite_query(req.message, history)
-    chunks = retrieve(search_query, state.vector_store)
-    context = format_context(chunks)
-    sources = [
-        {"filename": c["filename"], "page": c.get("page"), "score": c["score"]}
-        for c in chunks
-    ]
+    chunks = await asyncio.to_thread(
+        retrieve_v2, search_query, state.composite, settings.top_k
+    )
+    context = format_context_v2(chunks)
+    sources = [_source_card(c) for c in chunks]
     messages = build_messages(
         req.message,
         context,
@@ -218,6 +220,36 @@ async def chat(req: ChatRequest):
         yield {"event": "done", "data": ""}
 
     return EventSourceResponse(event_stream())
+
+
+def _source_card(c: dict) -> dict:
+    """Map a retrieved chunk to a UI-friendly source card. The displayed
+    `score` is a 0-1 confidence (not the internal ranking score):
+
+      exact_id match  -> 1.00  (badge: "exact match")
+      exact_cell hit  -> 0.95  (badge: "field match")
+      otherwise       -> raw text cosine similarity   (badge: "semantic")
+
+    `_rank_score` and `_score_breakdown` are still attached for debugging."""
+    bd = c.get("_score_breakdown") or {}
+    if bd.get("exact_id"):
+        score = 1.00
+        match = "exact"
+    elif bd.get("exact_cell"):
+        score = 0.95
+        match = "field"
+    else:
+        score = float(bd.get("text_sim", 0.0))
+        match = "semantic"
+    return {
+        "filename": c["file"],
+        "page": c.get("page"),
+        "type": c["chunk_type"],
+        "canonical_id": c.get("canonical_id"),
+        "score": round(score, 3),
+        "match": match,
+        "rank_score": round(float(c.get("_score", 0.0)), 3),
+    }
 
 
 def _run_compute_metric(args: dict) -> dict:

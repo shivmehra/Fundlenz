@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     chunk_tokens: int = 180
     chunk_overlap: int = 40
     history_turns: int = 4
+    # v2 multi-index pipeline: numeric ANN is gated. At a few-thousand-row scale
+    # a pandas filter via query_table is faster and exact than FAISS L2.
+    enable_numeric_ann: bool = False
 
     @property
     def index_dir(self) -> Path:

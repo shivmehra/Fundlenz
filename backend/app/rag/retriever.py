@@ -1,20 +1,19 @@
+"""Back-compat shim. The v2 pipeline routes retrieval through
+`app.retrieval.orchestrator.retrieve_v2`. This module preserves the old
+`retrieve(query, store, k=None)` signature so legacy callers (and a few
+tests that imported it) still work, but it no longer accepts a raw
+VectorStore — it expects a CompositeIndex (or anything with `text_search`
+and the orchestrator-required surface)."""
 from app.config import settings
-from app.rag.embedder import embed
+from app.index.composite import CompositeIndex
+from app.rag.schema import ChunkMeta
+from app.retrieval.orchestrator import retrieve_v2
 
 
-def retrieve(query: str, store, k: int | None = None) -> list[dict]:
-    k = k or settings.top_k
-    qv = embed([query])
-    return store.search(qv, k)
+def retrieve(query: str, store: CompositeIndex, k: int | None = None) -> list[ChunkMeta]:
+    return retrieve_v2(query, store, k or settings.top_k)
 
 
-def format_context(chunks: list[dict]) -> str:
-    if not chunks:
-        return "(no relevant context found)"
-    blocks: list[str] = []
-    for i, c in enumerate(chunks, start=1):
-        loc = c.get("filename", "?")
-        if c.get("page") is not None:
-            loc += f" p.{c['page']}"
-        blocks.append(f"[{i}] {loc}\n{c.get('text', '')}")
-    return "\n\n".join(blocks)
+def format_context(chunks: list[ChunkMeta]) -> str:
+    from app.retrieval.orchestrator import format_context_v2
+    return format_context_v2(chunks)

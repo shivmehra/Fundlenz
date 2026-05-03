@@ -231,7 +231,44 @@ body {
   color: var(--muted);
 }
 .sources summary { cursor: pointer; }
-.sources li { margin: 2px 0; }
+.sources ul { list-style: none; padding-left: 0; margin: 6px 0 0; }
+.sources li {
+  margin: 4px 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.confidence {
+  display: inline-block;
+  min-width: 38px;
+  text-align: center;
+  padding: 1px 6px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  border: 1px solid transparent;
+}
+.confidence-exact {
+  background: rgba(46, 160, 67, 0.18);
+  color: #56d364;
+  border-color: rgba(46, 160, 67, 0.45);
+}
+.confidence-field {
+  background: rgba(88, 166, 255, 0.16);
+  color: #79c0ff;
+  border-color: rgba(88, 166, 255, 0.45);
+}
+.confidence-semantic {
+  background: rgba(139, 148, 158, 0.16);
+  color: var(--muted);
+  border-color: rgba(139, 148, 158, 0.45);
+}
+
+.source-file { color: var(--text); }
+.source-meta { color: var(--muted); }
 
 .mode-pills {
   display: flex;

@@ -7,8 +7,8 @@ def test_empty_chunks_returns_placeholder():
 
 def test_includes_filename_and_page():
     chunks = [
-        {"filename": "fund.pdf", "page": 3, "text": "expense ratio is 0.5%"},
-        {"filename": "fund.pdf", "page": 7, "text": "AUM 100M"},
+        {"file": "fund.pdf", "chunk_type": "text", "page": 3, "text": "expense ratio is 0.5%"},
+        {"file": "fund.pdf", "chunk_type": "text", "page": 7, "text": "AUM 100M"},
     ]
     out = format_context(chunks)
     assert "fund.pdf p.3" in out
@@ -18,7 +18,7 @@ def test_includes_filename_and_page():
 
 
 def test_omits_page_when_missing():
-    chunks = [{"filename": "summary.csv", "text": "col1, col2"}]
+    chunks = [{"file": "summary.csv", "chunk_type": "tabular_summary", "text": "col1, col2"}]
     out = format_context(chunks)
     assert "summary.csv" in out
     assert "p." not in out
@@ -26,8 +26,8 @@ def test_omits_page_when_missing():
 
 def test_chunks_are_numbered():
     chunks = [
-        {"filename": "a.pdf", "page": 1, "text": "first"},
-        {"filename": "b.pdf", "page": 1, "text": "second"},
+        {"file": "a.pdf", "chunk_type": "text", "page": 1, "text": "first"},
+        {"file": "b.pdf", "chunk_type": "text", "page": 1, "text": "second"},
     ]
     out = format_context(chunks)
     assert "[1]" in out

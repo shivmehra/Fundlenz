@@ -1,7 +1,13 @@
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { Message } from "../types";
+import type { MatchKind, Message } from "../types";
 import PlotlyChart from "./PlotlyChart";
+
+const MATCH_LABELS: Record<MatchKind, string> = {
+  exact: "exact match",
+  field: "field match",
+  semantic: "semantic",
+};
 
 export default function MessageBubble({ msg }: { msg: Message }) {
   const empty = !msg.content;
@@ -25,12 +31,21 @@ export default function MessageBubble({ msg }: { msg: Message }) {
         <details className="sources">
           <summary>Sources ({msg.sources.length})</summary>
           <ul>
-            {msg.sources.map((s, i) => (
-              <li key={i}>
-                {s.filename}
-                {s.page != null ? ` — p.${s.page}` : ""} (score {s.score.toFixed(3)})
-              </li>
-            ))}
+            {msg.sources.map((s, i) => {
+              const pct = Math.round(Math.max(0, Math.min(1, s.score)) * 100);
+              const match = s.match ?? "semantic";
+              return (
+                <li key={i}>
+                  <span className={`confidence confidence-${match}`} title={MATCH_LABELS[match]}>
+                    {pct}%
+                  </span>
+                  <span className="source-file">{s.filename}</span>
+                  {s.type && <span className="source-meta"> · {s.type}</span>}
+                  {s.canonical_id && <span className="source-meta"> · {s.canonical_id}</span>}
+                  {s.page != null && <span className="source-meta"> · p.{s.page}</span>}
+                </li>
+              );
+            })}
           </ul>
         </details>
       )}
