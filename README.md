@@ -6,7 +6,7 @@ A local RAG chatbot for fund document analysis. Upload fund factsheets (PDF), ho
 
 - **Backend:** FastAPI + SSE streaming
 - **Vector store:** FAISS (local, persisted to disk)
-- **Embeddings:** SentenceTransformers `all-MiniLM-L6-v2`
+- **Embeddings:** SentenceTransformers `multi-qa-MiniLM-L6-cos-v1` (asymmetric, query/passage trained)
 - **LLM:** Ollama (default model: `qwen2.5:7b`, configurable via env)
 - **Parsing:** pdfplumber, python-docx, pandas (+ openpyxl)
 - **Analysis routing:** LLM-as-router via Ollama tool calling
@@ -82,10 +82,10 @@ frontend/
 |---|---|---|
 | `OLLAMA_HOST` | `http://localhost:11434` | |
 | `OLLAMA_MODEL` | `qwen2.5:7b` | recommended for tool-call discipline; swap to `llama3.2:3b` if 7B is too heavy, or `mistral:7b` if you have it cached |
-| `EMBED_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | |
-| `TOP_K` | `5` | chunks retrieved per query |
-| `CHUNK_TOKENS` | `800` | approx-token chunk size |
-| `CHUNK_OVERLAP` | `100` | tokens overlap between chunks |
+| `EMBED_MODEL` | `sentence-transformers/multi-qa-MiniLM-L6-cos-v1` | asymmetric query/passage embedder, 384-dim |
+| `TOP_K` | `10` | chunks retrieved per query |
+| `CHUNK_TOKENS` | `180` | approx-word chunk size (under embedder's 512-token cap) |
+| `CHUNK_OVERLAP` | `40` | words overlap between chunks |
 | `HISTORY_TURNS` | `4` | last N user+assistant turns sent with each query |
 
 ## Notes

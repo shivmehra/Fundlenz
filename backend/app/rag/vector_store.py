@@ -4,7 +4,7 @@ from pathlib import Path
 import faiss
 import numpy as np
 
-_EMBED_DIM = 384  # all-MiniLM-L6-v2 — hardcoded so startup never loads the model
+_EMBED_DIM = 384  # multi-qa-MiniLM-L6-cos-v1 — hardcoded so startup never loads the model
 
 
 class VectorStore:

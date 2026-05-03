@@ -88,7 +88,7 @@ Browser (React)
 |---|---|
 | Frontend | React + TypeScript + Vite |
 | Backend | FastAPI + uvicorn |
-| Embeddings | SentenceTransformers `all-MiniLM-L6-v2` (local, 384-dim) |
+| Embeddings | SentenceTransformers `multi-qa-MiniLM-L6-cos-v1` (local, 384-dim, asymmetric — query/passage trained) |
 | Vector DB | FAISS `IndexFlatIP` (cosine similarity via inner product on L2-normalized vectors) |
 | LLM | Qwen 2.5 7B via Ollama (configurable via `OLLAMA_MODEL` env var) |
 | PDF parsing | pdfplumber (preserves tables) |
@@ -237,16 +237,27 @@ Single-sheet Excel and CSV files use the bare filename, unchanged.
 ### 2. Chat Request (`POST /chat`)
 
 ```
-{session_id, message}
+{session_id, message, mode}
     │
     ▼
-rag/retriever.py::retrieve()
-    └─ embed query → FAISS search top-5 → list of chunk dicts with scores
+llm/ollama_client.py::rewrite_query(message, history)
+    └─ folds prior turns into a self-contained search query
+       (e.g. "what is the NAV regular?" + history mentioning ITI Fund
+        →  "ITI Balanced Advantage Fund NAV regular value")
+       skipped when history is empty; falls back to original on error
+
+    │
+    ▼
+rag/retriever.py::retrieve(search_query)
+    └─ embed search_query → FAISS search top-K (TOP_K=10 by default)
+       → list of chunk dicts with scores
 
     │
     ▼
 llm/ollama_client.py::build_messages()
-    └─ [system prompt] + last 4 turns history + user message with injected context
+    └─ [system prompt] + last 4 turns history + ORIGINAL user message
+       with injected context (the rewritten query is NOT shown to the LLM
+       at generation time — only used for retrieval)
 
     │
     ▼
@@ -326,9 +337,9 @@ Reads `.env` via pydantic-settings. All configuration lives here — never hardc
 |---|---|---|
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama server URL |
 | `OLLAMA_MODEL` | `qwen2.5:7b` | Model name as seen in `ollama list`. Qwen 2.5 is the recommended default for tool-call discipline; Mistral 7B and Llama 3.x also work. |
-| `EMBED_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | Embedding model (256-token max — see Pitfalls) |
-| `TOP_K` | `5` | FAISS results per query |
-| `CHUNK_TOKENS` | `180` | Words per chunk — kept under the embedder's 256-token cap |
+| `EMBED_MODEL` | `sentence-transformers/multi-qa-MiniLM-L6-cos-v1` | Embedding model. Asymmetric (query/passage trained) — better at matching short user questions to longer document chunks than the old symmetric `all-MiniLM-L6-v2`. 384-dim, 512-token max — see Pitfalls. |
+| `TOP_K` | `10` | FAISS results per query. Bumped from 5 because per-row chunks dilute relevance — short queries against verbose row strings need more recall headroom. |
+| `CHUNK_TOKENS` | `180` | Words per chunk — well under the embedder's 512-token cap |
 | `CHUNK_OVERLAP` | `40` | Overlap words between chunks |
 | `HISTORY_TURNS` | `4` | Number of conversation turns sent to LLM |
 
@@ -449,6 +460,7 @@ Preserves structure that the old "flatten to plain text" parser threw away:
 ### `app/llm/ollama_client.py` + `app/llm/tools.py`
 
 - Two tools are registered: `compute_metric` (aggregations → number / chart) and `query_table` (filter/sort/slice → markdown table). Both target tabular files only.
+- `rewrite_query(message, history)` — non-streaming Ollama call that folds prior conversation context into a self-contained search query. Runs *before* retrieval. The rewritten query is used only to embed and search FAISS; the original message still flows into `build_messages` for generation. Skipped when history is empty; falls back to the original message on any error (degraded retrieval is better than a 500). Adds ~0.5–1.5s latency per chat turn on Qwen 7B.
 - `stream_chat(messages, tools=None)` is a single streaming call. When `tools=None`, no tools are sent to Ollama at all. When `tools=[...]`, the model may emit a tool call in the final chunk; text tokens stream live before that.
 - **Tool selection is gated server-side, not left to the model alone.** Local 7B-class models tend to call any registered tool even for plain-text questions like "summarize the file" (with hallucinated arguments). Qwen 2.5 7B is markedly better at this than Mistral 7B, but the gate stays in place because it costs nothing and protects against regressions when swapping models. The selection logic is `main.py::_select_tools(message, mode)`, which combines:
   1. **User-chosen mode** (sent in the chat request as `mode: "auto" | "chat" | "aggregate" | "query"`):
@@ -572,8 +584,11 @@ On Windows, `localhost` resolves to both `::1` (IPv6) and `127.0.0.1` (IPv4). uv
 
 These are the non-obvious traps that the codebase already accounts for. Don't undo them without knowing why.
 
-**Embedder has a 256-token cap.**
-`all-MiniLM-L6-v2` silently truncates input past `max_seq_length=256`. With the default chunking of 800 words (≈1000 tokens), only the first ~190 words of every chunk were being embedded — the rest was invisible to retrieval. `CHUNK_TOKENS` is now 180 words (≈234 tokens), safely under the limit. If you swap the embedder, check its `max_seq_length` and update `CHUNK_TOKENS` accordingly.
+**Embedder has a 512-token cap.**
+`multi-qa-MiniLM-L6-cos-v1` silently truncates input past `max_seq_length=512`. `CHUNK_TOKENS` is set to 180 words (≈234 tokens), well under the limit. If you swap the embedder, check its `max_seq_length` and update `CHUNK_TOKENS` accordingly.
+
+**Embedder is asymmetric — re-embedding is mandatory if you swap.**
+`multi-qa-MiniLM-L6-cos-v1` is trained on (query, passage) pairs from MS MARCO / NQ — the geometry differs from a symmetric model like `all-MiniLM-L6-v2` even though both are 384-dim. Vectors from one model are not comparable to vectors from another. After changing `EMBED_MODEL`, delete `data/indexes/*.faiss` and `*.pkl` and re-ingest your documents.
 
 **FAISS dimension is hardcoded.**
 `vector_store.py` defines `_EMBED_DIM = 384` so the FAISS index can initialize at startup without loading the (slow) embedding model. If you change `EMBED_MODEL`, also change `_EMBED_DIM` and delete `data/indexes/` — embeddings are model-specific.

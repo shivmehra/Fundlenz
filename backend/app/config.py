@@ -7,11 +7,15 @@ class Settings(BaseSettings):
 
     ollama_host: str = "http://localhost:11434"
     ollama_model: str = "qwen2.5:7b"
-    embed_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    # Asymmetric embedder trained on (query, passage) pairs — better fit for
+    # short user questions retrieving longer document chunks than the
+    # symmetric all-MiniLM-L6-v2. Same 384-dim, max_seq_length=512.
+    embed_model: str = "sentence-transformers/multi-qa-MiniLM-L6-cos-v1"
     data_dir: Path = Path("./data")
-    top_k: int = 5
-    # all-MiniLM-L6-v2 has max_seq_length=256 tokens (~190 English words).
-    # Beyond that, the embedder silently truncates — keep chunks under 200 words.
+    top_k: int = 10
+    # multi-qa-MiniLM-L6-cos-v1 has max_seq_length=512 tokens (~390 English words).
+    # 180 words (~234 tokens) leaves comfortable headroom; if you swap embedders,
+    # check the new max_seq_length and adjust.
     chunk_tokens: int = 180
     chunk_overlap: int = 40
     history_turns: int = 4

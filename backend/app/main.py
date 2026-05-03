@@ -15,7 +15,7 @@ from app.analysis.metrics import compute
 from app.analysis.query import query_table
 from app.config import settings
 from app.ingest import ingest_file
-from app.llm.ollama_client import build_messages, stream_chat
+from app.llm.ollama_client import build_messages, rewrite_query, stream_chat
 from app.llm.tools import TOOL_COMPUTE_METRIC, TOOL_QUERY_TABLE, TOOLS
 from app.rag.retriever import format_context, retrieve
 
@@ -144,7 +144,10 @@ class ChatRequest(BaseModel):
 @app.post("/chat")
 async def chat(req: ChatRequest):
     history = list(state.chat_history[req.session_id])
-    chunks = retrieve(req.message, state.vector_store)
+    # Fold prior turns into the retrieval query so follow-ups like "what is its NAV?"
+    # find the entity from earlier turns. Generation still sees the original message.
+    search_query = await rewrite_query(req.message, history)
+    chunks = retrieve(search_query, state.vector_store)
     context = format_context(chunks)
     sources = [
         {"filename": c["filename"], "page": c.get("page"), "score": c["score"]}
