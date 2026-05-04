@@ -442,6 +442,7 @@ label.upload input { display: none; }
 }
 
 .toggle-row {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -461,40 +462,70 @@ label.upload input { display: none; }
 /* ── Tooltip ── */
 
 .tooltip-anchor {
-  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 16px;
-  height: 16px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
   font-size: 11px;
   color: var(--muted);
-  cursor: help;
+  cursor: pointer;
   flex-shrink: 0;
+  user-select: none;
+  transition: background 0.12s, color 0.12s;
 }
 
-.tooltip-anchor .tooltip-text {
-  display: none;
+.tooltip-anchor:hover {
+  background: rgba(139, 148, 158, 0.18);
+  color: var(--text);
+}
+
+.tooltip-anchor.open {
+  background: rgba(88, 166, 255, 0.22);
+  color: var(--accent);
+}
+
+/* Pinned tooltip — anchored to the toggle-row's right edge so it has the
+   full sidebar width to work with, and going up so it doesn't fall off
+   the viewport (settings section sits at the bottom of the sidebar). */
+.tooltip-text {
   position: absolute;
-  left: 50%;
-  bottom: calc(100% + 8px);
-  transform: translateX(-50%);
-  width: 210px;
+  right: 0;
+  bottom: calc(100% + 6px);
+  width: 200px;
   background: #21262d;
   border: 1px solid var(--border);
   border-radius: 6px;
-  padding: 8px 10px;
+  padding: 10px 26px 10px 10px;
   font-size: 11px;
   line-height: 1.55;
   color: var(--text);
   z-index: 200;
-  pointer-events: none;
   white-space: normal;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
 }
 
-.tooltip-anchor:hover .tooltip-text {
-  display: block;
+.tooltip-close {
+  position: absolute;
+  top: 2px;
+  right: 4px;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  background: transparent;
+  color: var(--muted);
+  border: none;
+  border-radius: 3px;
+  font-size: 16px;
+  font-weight: 400;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.tooltip-close:hover {
+  background: rgba(139, 148, 158, 0.18);
+  color: var(--text);
 }
 
 /* ── Toggle switch ── */
