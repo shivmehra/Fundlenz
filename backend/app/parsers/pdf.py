@@ -73,6 +73,11 @@ def extract_pdf_tables_as_csv(pdf_path: Path, output_dir: Path | None = None) ->
     Returns list of generated CSV file paths. If output_dir is None, uses
     the same directory as the PDF. CSV filenames follow the pattern:
     {pdf_name}_page{N}_table{M}.csv
+
+    The header row is fixed up before write: empty / blank cells are renamed
+    to `col_<i>` so pandas does not produce a forest of `Unnamed: N` columns
+    that the downstream tabular pipeline ends up treating as garbage and
+    cleaning away to nothing.
     """
     if output_dir is None:
         output_dir = pdf_path.parent
@@ -82,18 +87,60 @@ def extract_pdf_tables_as_csv(pdf_path: Path, output_dir: Path | None = None) ->
     csv_paths: list[Path] = []
     base_name = pdf_path.stem
 
-    for page_num, record in enumerate(records, start=1):
+    for record in records:
+        page_num = record["page"]
         tables = record.get("tables", [])
         for table_idx, table in enumerate(tables, start=1):
+            normalized = _normalize_table_for_csv(table)
+            if normalized is None:
+                continue  # too small / all-empty to be useful as a CSV
             csv_name = f"{base_name}_page{page_num}_table{table_idx}.csv"
             csv_path = output_dir / csv_name
 
             with open(csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerows(table)
+                writer.writerows(normalized)
             csv_paths.append(csv_path)
 
     return csv_paths
+
+
+def _normalize_table_for_csv(table: list[list[str]]) -> list[list[str]] | None:
+    """Return a copy of `table` with header cells filled in (`col_1`, `col_2`,
+    ...), de-duplicated header names, and a guarantee of at least one data row.
+
+    Returns None when the table is too degenerate to be worth writing — fewer
+    than 2 rows, fewer than 2 columns, or every cell empty. Without this, PDFs
+    with stray 2x1 'tables' produce CSV files that pandas reads as empty,
+    `parse_tabular` returns `[]`, and `ingest_file` silently registers nothing.
+    """
+    if not table or len(table) < 2:
+        return None
+
+    rows = [list(r) for r in table]
+    n_cols = max(len(r) for r in rows)
+    if n_cols < 2:
+        return None
+
+    rows = [r + [""] * (n_cols - len(r)) for r in rows]
+    if not any(any(c.strip() for c in r) for r in rows):
+        return None
+
+    header = rows[0]
+    seen: dict[str, int] = {}
+    fixed_header: list[str] = []
+    for i, cell in enumerate(header):
+        name = (cell or "").strip()
+        if not name:
+            name = f"col_{i + 1}"
+        if name in seen:
+            seen[name] += 1
+            name = f"{name}_{seen[name]}"
+        else:
+            seen[name] = 1
+        fixed_header.append(name)
+    rows[0] = fixed_header
+    return rows
 
 
 def _extract_validated_tables(page) -> list[list[list[str]]]:

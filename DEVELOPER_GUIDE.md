@@ -1,6 +1,6 @@
 # Fundlenz — Developer Guide
 
-A local RAG chatbot that ingests fund documents (PDFs, Word, CSV, Excel) and answers questions using semantic search, with optional pandas-driven quantitative analysis and Plotly charts. Everything runs locally — no cloud services required.
+A local RAG chatbot that ingests fund documents (PDFs, Word, CSV, Excel) and answers questions using a multi-index retrieval pipeline (inverted exact-match + text ANN + numeric range), deterministic ranking, optional pandas-driven analysis, and Plotly charts. Everything runs locally — no cloud services required.
 
 ---
 
@@ -10,12 +10,18 @@ A local RAG chatbot that ingests fund documents (PDFs, Word, CSV, Excel) and ans
 2. [Architecture Overview](#architecture-overview)
 3. [Project Layout](#project-layout)
 4. [Data Flow](#data-flow)
-5. [Backend — Module Reference](#backend--module-reference)
-6. [Frontend — Module Reference](#frontend--module-reference)
-7. [Key Design Decisions](#key-design-decisions)
-8. [Pitfalls & Constraints](#pitfalls--constraints)
-9. [Adding Features](#adding-features)
-10. [Testing](#testing)
+5. [Chunk Schema](#chunk-schema)
+6. [Retrieval Pipeline Walkthrough](#retrieval-pipeline-walkthrough)
+7. [Backend — Module Reference](#backend--module-reference)
+8. [Frontend — Module Reference](#frontend--module-reference)
+9. [Endpoints](#endpoints)
+10. [Reranking Knobs](#reranking-knobs)
+11. [Config Flags Reference](#config-flags-reference)
+12. [Key Design Decisions](#key-design-decisions)
+13. [Pitfalls & Constraints](#pitfalls--constraints)
+14. [Adding Features](#adding-features)
+15. [Migration](#migration)
+16. [Testing](#testing)
 
 ---
 
@@ -54,32 +60,49 @@ npm install
 start.bat
 ```
 
-Opens two cmd windows: backend on port 8000, frontend on port 5173.
-
-Open `http://localhost:5173` in a browser.
+Opens two cmd windows: backend on port 8000, frontend on port 5173. Open `http://localhost:5173` in a browser.
 
 ---
 
 ## Architecture Overview
 
 ```
-Browser (React)
-    │
-    ├── POST /api/ingest   ──► Ingestion Pipeline ──► FAISS index (disk)
-    │                                               └─► In-memory DataFrame store
-    │
-    ├── GET  /api/documents ─► FAISS metadata list
-    ├── DELETE /api/documents/{fn} ─► FAISS rebuild-on-delete
-    │
-    └── POST /api/chat      ──► Retriever (FAISS top-5)
-            │                       │
-            │                  SSE stream back to browser
-            │
-            └── Ollama (Qwen 2.5 7B by default)
-                    │
-                    ├── text answer ─────────────────► token events (streamed)
-                    ├── compute_metric tool call ────► pandas aggregation ──► Plotly JSON
-                    └── query_table tool call ───────► pandas filter/sort ──► markdown table
+                INGEST                                   RETRIEVAL
++----------------------+   +-------------------+      +-------------------------+
+| parsers/             |   | chunkers/         |      | retrieval/router.py     |
+|   pdf.py             |   |   text_chunker    |      |   intent classifier     |
+|   docx.py            |-->|   tabular_chunker |      +------------+------------+
+|   tabular.py         |   |   entity_chunker  |                   |
++----------+-----------+   |   timewindow      |                   v
+           |               |   numeric_encoder |      +-------------------------+
+           |               +---------+---------+      | retrieval/exact.py      |
+           |                         |                |   inverted lookup       |
+           v                         v                +------------+------------+
++----------------------+   +-------------------+                   |
+| extract_pdf_tables   |   | id/canonical.py   |                   v
+|     _as_csv          |   |   normalize_name  |      +-------------------------+
+| (PDF tables → CSV    |   |   AliasMap        |      | retrieval/semantic.py   |
+|  → tabular pipeline) |   +---------+---------+      |   text ANN              |
++----------------------+             |                |   numeric ANN (gated)   |
+                                     v                +------------+------------+
+                +-------------------------------+                  |
+                |     CompositeIndex            |                  v
+                |  index/text_ann.py            |     +-------------------------+
+                |  index/numeric_ann.py         |     | retrieval/rerank.py     |
+                |  index/inverted.py            |     |   linear score          |
+                |  index/metadata_store.py      |     +------------+------------+
+                |                               |                  |
+                |  Persistence:                 |                  v
+                |    text.faiss + ids.npy       |     +-------------------------+
+                |    numeric_<fid>.faiss        |     | retrieval/cross_encoder |
+                |    inverted.json              |     |   semantic-tier rerank  |
+                |    metadata.sqlite            |     +------------+------------+
+                |    scaler_<fid>.json          |                  |
+                |    aliases.json               |                  v
+                +-------------------------------+     +-------------------------+
+                                                      | LLM synthesis (Ollama)  |
+                                                      |   provenance + cites    |
+                                                      +-------------------------+
 ```
 
 **Stack**
@@ -88,10 +111,13 @@ Browser (React)
 |---|---|
 | Frontend | React + TypeScript + Vite |
 | Backend | FastAPI + uvicorn |
-| Embeddings | SentenceTransformers `multi-qa-MiniLM-L6-cos-v1` (local, 384-dim, asymmetric — query/passage trained) |
-| Vector DB | FAISS `IndexFlatIP` (cosine similarity via inner product on L2-normalized vectors) |
-| LLM | Qwen 2.5 7B via Ollama (configurable via `OLLAMA_MODEL` env var) |
-| PDF parsing | pdfplumber (preserves tables) |
+| Embeddings | SentenceTransformers `multi-qa-MiniLM-L6-cos-v1` (asymmetric, 384-dim) |
+| Vector DB | FAISS `IndexFlatIP` (cosine via inner product on L2-normalized vectors) |
+| Inverted index | JSON file (`inverted.json`) — three keyspaces (`id:`, `cell:`, `enum:`) |
+| Metadata store | SQLite (`metadata.sqlite`) |
+| Cross-encoder | `cross-encoder/ms-marco-MiniLM-L-6-v2` (optional 2nd-stage rerank) |
+| LLM | Qwen 2.5 7B via Ollama (configurable via `OLLAMA_MODEL`) |
+| PDF parsing | pdfplumber (preserves tables; tables also extracted to CSV) |
 | Tabular | pandas |
 | Streaming | Server-Sent Events (SSE) |
 
@@ -102,50 +128,87 @@ Browser (React)
 ```
 Fundlenz/
 ├── start.bat                   # Launch both servers
+├── DEVELOPER_GUIDE.md          # This file
 ├── backend/
 │   ├── .env                    # Runtime config (gitignored)
 │   ├── .env.example            # Template — copy to .env
 │   ├── requirements.txt
 │   ├── data/
-│   │   ├── indexes/            # index.faiss + metadata.pkl (persisted)
-│   │   └── uploads/            # uploaded files (gitignored)
-│   ├── conftest.py            # Adds backend/ to sys.path for tests
-│   ├── tests/                 # pytest suite (see Testing section)
+│   │   ├── indexes/            # CompositeIndex artifacts (persisted)
+│   │   │   ├── text.faiss + text_ids.npy
+│   │   │   ├── numeric_<file_id>.faiss + _ids.npy   (when enable_numeric_ann)
+│   │   │   ├── inverted.json
+│   │   │   ├── metadata.sqlite
+│   │   │   ├── scaler_<file_id>.json
+│   │   │   └── aliases.json
+│   │   └── uploads/            # uploaded files + auto-generated CSVs from PDF tables
+│   ├── conftest.py
+│   ├── notebooks/
+│   │   └── demo_v2.ipynb       # Walks each retrieval intent end-to-end
+│   ├── scripts/
+│   │   └── migrate_v2.py       # Wipes data/indexes/* and re-ingests data/uploads/*
+│   ├── tests/                  # pytest suite (203 tests)
 │   └── app/
-│       ├── main.py             # FastAPI app, routes
-│       ├── config.py           # Settings (pydantic-settings, reads .env)
-│       ├── state.py            # In-memory singletons
-│       ├── ingest.py           # Ingestion orchestrator (handles multi-sheet)
+│       ├── main.py             # FastAPI app, routes, threshold bypass, confidence tiers
+│       ├── config.py           # Pydantic Settings
+│       ├── state.py            # CompositeIndex + dataframes + chat history
+│       ├── ingest.py           # Parser → chunker dispatch
 │       ├── text.py             # Universal Unicode + whitespace normalization
 │       ├── parsers/
-│       │   ├── pdf.py          # pdfplumber + boilerplate stripping + normalization
-│       │   ├── docx.py         # python-docx: heading hierarchy + tables → markdown
-│       │   └── tabular.py      # pandas: header sniff + multi-sheet + cleaning + synopsis
+│       │   ├── pdf.py          # pdfplumber — text + tables_md + raw tables;
+│       │   │                   #   extract_pdf_tables_as_csv writes CSVs
+│       │   ├── docx.py         # python-docx — heading hierarchy + tables → markdown
+│       │   └── tabular.py      # CSV/Excel — header sniff, multi-sheet, cleaning
+│       ├── chunkers/
+│       │   ├── common.py            # make_meta() — fills mandatory ChunkMeta fields
+│       │   ├── text_chunker.py      # Sliding-window text + table chunks
+│       │   ├── tabular_chunker.py   # synopsis + tabular_summary + enumeration + row
+│       │   ├── entity_chunker.py    # One chunk per canonical_id
+│       │   ├── numeric_encoder.py   # numeric_vector chunks (no text body)
+│       │   └── timewindow_chunker.py# detect_timeseries + 30/90/365d windows
+│       ├── id/
+│       │   └── canonical.py    # normalize_name() + AliasMap
+│       ├── index/
+│       │   ├── composite.py        # CompositeIndex + IngestItem
+│       │   ├── text_ann.py         # FAISS IndexFlatIP, chunk_id-keyed
+│       │   ├── numeric_ann.py      # Per-file IndexFlatL2 (gated)
+│       │   ├── inverted.py         # id: / cell: / enum: keyspaces
+│       │   └── metadata_store.py   # SQLite (chunks table, indexes on canonical_id/file/type)
 │       ├── rag/
-│       │   ├── embedder.py     # SentenceTransformer + chunk_text()
-│       │   ├── vector_store.py # FAISS wrapper with save/load/delete
-│       │   └── retriever.py    # Query embedding + top-k search
+│       │   ├── schema.py            # ChunkMeta TypedDict + SCHEMA_VERSION
+│       │   ├── embedder.py          # SentenceTransformer + chunk_text()
+│       │   ├── numeric_scaler.py    # Per-column z-score, NaN-safe
+│       │   └── retriever.py         # Thin shim over orchestrator.retrieve_v2
+│       ├── retrieval/
+│       │   ├── router.py            # Rule-based intent classifier (Plan dataclass)
+│       │   ├── exact.py             # resolve_canonical_id + extract_cell_predicates
+│       │   ├── semantic.py          # Text + numeric ANN dispatch
+│       │   ├── rerank.py            # Deterministic linear scoring formula
+│       │   ├── cross_encoder.py     # Stage-2 CE reranker (lazy-loaded)
+│       │   └── orchestrator.py      # retrieve_v2 + format_context_v2
 │       ├── llm/
-│       │   ├── ollama_client.py  # Streaming chat with tool support
-│       │   └── tools.py          # Tool schema + system prompt
+│       │   ├── ollama_client.py     # build_messages, rewrite_query, stream_chat
+│       │   └── tools.py             # compute_metric + query_table schemas
 │       └── analysis/
-│           ├── metrics.py      # pandas aggregations (compute_metric tool)
-│           ├── charts.py       # Plotly JSON specs
-│           └── query.py        # filter/sort/select/limit (query_table tool)
+│           ├── metrics.py           # compute() — top/mean/sum/count/min/max/trend
+│           ├── query.py             # query_table — filter/sort/select/limit
+│           ├── charts.py            # Plotly JSON spec generator
+│           └── column_match.py      # Token-overlap column resolver (drives threshold bypass)
 └── frontend/
     ├── vite.config.ts          # Proxies /api/* to 127.0.0.1:8000 (IPv4 only)
     └── src/
-        ├── main.tsx            # React entry point
-        ├── App.tsx             # Root layout (sidebar + chat)
-        ├── styles.css          # Global CSS (CSS variables, grid layout)
-        ├── types.ts            # Shared TypeScript types
+        ├── main.tsx
+        ├── App.tsx             # Sidebar + chat layout, hamburger drawer for mobile
+        ├── styles.css          # CSS variables, grid layout, table rendering rules
+        ├── types.ts            # Source / ChartPayload / Message / Confidence
         ├── api/
-        │   └── client.ts       # All fetch/SSE calls to the backend
+        │   └── client.ts       # uploadFile, getDocuments, deleteDocument, streamChat
         └── components/
-            ├── ChatWindow.tsx  # Message list + composer
-            ├── MessageBubble.tsx # Single message (text + sources + chart)
-            ├── DocumentList.tsx  # Sidebar: indexed files + delete
-            └── FileUpload.tsx    # Sidebar: file picker + status
+            ├── ChatWindow.tsx     # Message list + composer + mode pills
+            ├── MessageBubble.tsx  # Single message (text + sources + chart + confidence)
+            ├── DocumentList.tsx   # Sidebar: indexed files + delete
+            ├── FileUpload.tsx     # Sidebar: file picker + status (incl. PDF table extracts)
+            └── PlotlyChart.tsx    # Renders ChartPayload from compute_metric
 ```
 
 ---
@@ -158,355 +221,392 @@ Fundlenz/
 File upload
     │
     ▼
-ingest.py::ingest_file()
+ingest.py::ingest_file(path, original_filename)
     │
     ├─ .pdf  ──► parsers/pdf.py::parse_pdf()
-    │                ├─ pdfplumber extracts per-page text + tables
-    │                ├─ Repeating boilerplate (headers/footers/disclaimers) detected
-    │                │    by counting line frequency across pages — anything appearing
-    │                │    on ≥3 pages is stripped before embedding
+    │                ├─ pdfplumber: per-page text + tables (lines strategy first,
+    │                │   text-alignment fallback). _is_valid_table rejects
+    │                │   <2 rows / <2 cols / >70% empty.
+    │                ├─ Repeating boilerplate stripped (lines on ≥3 distinct pages)
     │                ├─ Page-number patterns ("Page 3 of 12", "5 / 12") stripped
-    │                ├─ text.normalize() applied (Unicode + dehyphenate + whitespace)
-    │                └─ Tables → markdown (| col | col |) before chunking
+    │                ├─ text.normalize() (Unicode + dehyphenate + whitespace)
+    │                └─ Returns [{page, text, tables_md, tables}, ...]
     │
     ├─ .docx ──► parsers/docx.py::parse_docx()
-    │                ├─ Walks the body XML in document order so paragraphs and
-    │                │    tables interleave correctly
-    │                ├─ Heading 1..9 styles → markdown # / ## / ### prefixes
-    │                ├─ Tables → markdown pipe-tables (same renderer as PDF)
+    │                ├─ Walks doc.element.body in document order so paragraphs
+    │                │   and tables interleave correctly
+    │                ├─ Heading 1..9 styles → markdown # / ## / ###
+    │                ├─ Tables → markdown pipe-tables
     │                └─ text.normalize() applied at the end
     │
     └─ .csv/.xlsx ──► parsers/tabular.py::parse_tabular()
-                         ├─ Returns a list of sheet records (CSV → 1 record;
-                         │    multi-sheet Excel → 1 record per non-empty sheet)
-                         ├─ Header-row sniffing: if pandas creates `Unnamed: N`
-                         │    columns at row 0, scans rows 1..4 for the real header
-                         ├─ _clean(): strip column names, normalize null sentinels,
-                         │    drop empty rows/cols, coerce numeric strings (currency,
-                         │    percent), coerce date-named columns. Coercion only
-                         │    commits if ≥80% of non-null values parse.
-                         ├─ synopsis(): one-paragraph descriptive blurb (rows × cols,
-                         │    column types, date ranges, top categorical values) —
-                         │    embedded as the FIRST chunk for high-recall lookup.
-                         └─ _summarize(): rich stats dump (head + tail + middle rows
-                              for big files; describe(); value_counts; date ranges).
-                              Cleaned DataFrame is kept in state.dataframes_by_file_id.
+                         ├─ List of sheet records (CSV → 1; multi-sheet Excel → N)
+                         ├─ Header-row sniffing (Unnamed:N detection, scans rows 1..4)
+                         ├─ _clean(): strip, null sentinels, drop-empty,
+                         │   currency/percent → float, date hint → datetime
+                         │   (80% parse threshold)
+                         └─ synopsis() + _summarize() for chunk bodies
 
     │
     ▼
-rag/embedder.py::chunk_text()   — 180-word chunks, 40-word overlap
-                                  (kept under embedder's 256-token cap;
-                                   see Pitfalls & Constraints below)
+chunker dispatch (ingest.py::_ingest_tabular_sheet for tabular files)
+    │
+    ├─ build_text_chunks         (PDF/DOCX only)
+    ├─ build_table_chunk         (PDF: one chunk per detected table_md)
+    ├─ build_tabular_chunks      (synopsis + tabular_summary + enumeration + row)
+    ├─ build_entity_chunks       (one per canonical_id, attribute-aggregated)
+    ├─ build_numeric_vectors     (per-row z-scored numeric vectors)
+    └─ build_time_windows        (only when detect_timeseries finds multi-date data)
     │
     ▼
-rag/embedder.py::embed()        — SentenceTransformer encodes all chunks
-    │                              (lazy-loaded on first call, cached)
-    ▼
-rag/vector_store.py::add()      — adds vectors to FAISS IndexFlatIP
-    │                              stores raw vectors in self._vectors
-    │                              stores metadata list in self.metadata
-    ▼
-rag/vector_store.py::save()     — writes index.faiss + metadata.pkl to disk
+embed all text-bearing chunks in a single batch
     │
     ▼
-state.documents[filename] = {file_id, type, chunks}
+state.composite.add_chunks(items)
+    ├─ meta.upsert_many              (SQLite, single transaction)
+    ├─ text_ann.add(vecs, chunk_ids) (FAISS IndexFlatIP)
+    ├─ numeric_ann.add(...)          (per file_id; only when enable_numeric_ann)
+    └─ inverted index posts          (id: / cell: / enum:)
+    │
+    ▼
+state.composite.save() → text.faiss, inverted.json, metadata.sqlite, scaler_*.json
 ```
 
-Each chunk's metadata record stored in FAISS:
+**PDF table post-processing** (added in `main.py::ingest`):
 
-```python
+After the PDF itself is ingested, `parsers/pdf.py::extract_pdf_tables_as_csv` runs over every detected table and writes a CSV per table to `data/uploads/{pdf_stem}_page{N}_table{M}.csv`. Each CSV is then ingested independently via `ingest_file(csv_path, csv_path.name)` so the table data flows into the tabular pipeline (synopsis/enumeration/row/entity/numeric_vector chunks) and becomes queryable through `query_table` and `compute_metric`.
+
+The table-to-CSV writer normalizes the header row first (`_normalize_table_for_csv`): empty header cells get `col_1`, `col_2`, … placeholders, duplicate names get `_2` suffixes, ragged rows are padded, and degenerate tables (<2 rows / <2 cols / all empty) are skipped. Without this, pandas would read empty headers as `Unnamed: N`, `_clean` would strip them as junk, and the dataframe would collapse to empty silently.
+
+The `/ingest` response surfaces what landed:
+
+```json
 {
-  "file_id": "abc123",          # hex UUID slice
-  "filename": "fund.pdf",       # Compound for multi-sheet Excel: "fund.xlsx :: Sheet1"
-  "page": 3,                    # None for docx/tabular
-  "type": "text"|"table"|"tabular_summary"|"synopsis",
-  "text": "...chunk content..."
+  "filename": "report.pdf",
+  "chunks": 87,
+  "summary": "...",
+  "extracted_tables": [
+    {"filename": "report_page2_table1.csv", "chunks": 24},
+    {"filename": "report_page5_table1.csv", "chunks": 16},
+    {"filename": "report_page7_table1.csv", "chunks": 0,
+     "error": "..."}
+  ]
 }
 ```
 
-**Multi-sheet Excel files** become multiple logical files. A single upload of
-`fund.xlsx` with sheets `Holdings` and `Performance` produces:
-- Two file_ids
-- Two entries in `state.dataframes_by_file_id`
-- Two entries in `state.documents` (and the sidebar list) keyed by
-  `"fund.xlsx :: Holdings"` and `"fund.xlsx :: Performance"`
-- compute_metric calls use the compound filename as its `filename` argument
+Per-CSV failures are caught individually so one bad table can't suppress the rest. The upload status in the UI reads e.g. `Indexed 87 chunks (+2 tables from PDF, 1 failed)`.
 
-Single-sheet Excel and CSV files use the bare filename, unchanged.
+**Multi-sheet Excel** files become multiple logical files. `fund.xlsx` with sheets `Holdings` and `Performance` produces two file_ids, two `state.dataframes_by_file_id` entries, and two sidebar entries keyed `"fund.xlsx :: Holdings"` and `"fund.xlsx :: Performance"`. Single-sheet Excel and CSV files use the bare filename.
 
 ### 2. Chat Request (`POST /chat`)
 
 ```
-{session_id, message, mode}
+{session_id, message, mode: "auto" | "chat" | "aggregate" | "query"}
     │
     ▼
-llm/ollama_client.py::rewrite_query(message, history)
+ollama_client.py::rewrite_query(message, history)
     └─ folds prior turns into a self-contained search query
-       (e.g. "what is the NAV regular?" + history mentioning ITI Fund
-        →  "ITI Balanced Advantage Fund NAV regular value")
-       skipped when history is empty; falls back to original on error
+       (used for retrieval ONLY; original message still flows to the LLM)
 
     │
     ▼
-rag/retriever.py::retrieve(search_query)
-    └─ embed search_query → FAISS search top-K (TOP_K=10 by default)
-       → list of chunk dicts with scores
+router.py::classify_intent(message)
+    └─ Plan {intent, raw_entity_phrases, threshold?, window?}
+       Note: classified on the LITERAL message, not the rewritten one,
+       so broad intents ("List all benchmarks") don't get hijacked into
+       point-lookups by the rewriter. Entity phrases from the rewritten
+       query are merged in afterwards for coreference resolution.
 
     │
     ▼
-llm/ollama_client.py::build_messages()
-    └─ [system prompt] + last 4 turns history + ORIGINAL user message
-       with injected context (the rewritten query is NOT shown to the LLM
-       at generation time — only used for retrieval)
+orchestrator.py::retrieve_v2(search_query, composite, k, plan)
+    (full pipeline — see "Retrieval Pipeline Walkthrough" below)
 
     │
-    ▼
-main.py::_should_enable_tools(message)        — heuristic gate (see below)
+    ▼  back in main.py::event_stream()
+    │
+    ├─ yield "sources" event   (UI shows chunk cards with confidence badges)
+    │
+    ├─ Forced-mode short-circuit: if mode is "aggregate" or "query"
+    │   and no tabular file has been ingested, yield a friendly error
+    │   and stop before the LLM call.
+    │
+    ├─ Numeric-threshold deterministic bypass (mode != "chat"):
+    │   if intent is numeric_threshold and a column resolves in any
+    │   loaded tabular file, run pandas filtering directly across
+    │   every matching file (aggregating results), yield a
+    │   confidence: deterministic event, emit the answer as a
+    │   token event, and return. The LLM is never called.
     │
     ▼
-llm/ollama_client.py::stream_chat(messages, tools=…)  — streaming Ollama call
-    │                                                   tools omitted unless gated in
+llm/ollama_client.py::build_messages(message, context, history, tabular_files)
     │
-    ├─ Model answers in text  ──► yields {"type":"token", "content":"..."} per chunk
+    ▼
+main.py::_select_tools(message, mode)
+    ├─ "chat"       → None (no tools)
+    ├─ "aggregate"  → [compute_metric] iff a tabular file exists
+    ├─ "query"      → [query_table]   iff a tabular file exists
+    └─ "auto"       → keyword-gated (TOOLS or None)
     │
-    └─ Model calls compute_metric ──► yields {"type":"tool_call", "name":..., "arguments":...}
-
+    ▼
+stream_chat(messages, tools=...)
     │
-    ▼  (back in main.py::event_stream())
+    ├─ token chunks  ──► "event: token" (streamed live)
+    └─ tool_call ───────► _run_compute_metric / _run_query_table
+                              │
+                              └─ pandas execution
+                              └─ emit "event: chart" (compute_metric)
+                              └─ emit "event: token" with markdown table
     │
-    ├─ token events  ──► "event: token\ndata: <text>\n\n"  (streamed live)
+    ▼
+emit "event: confidence" with tier ∈ {deterministic, grounded, semantic}
     │
-    └─ tool_call ──► _run_compute_metric()
-                         └─ metrics.py::compute()  — pandas aggregation
-                         └─ charts.py::chart_spec() — Plotly JSON
-                         └─ "event: chart\ndata: <json>\n\n"
+    ▼
+emit "event: done"
 ```
 
-SSE event sequence the browser receives:
+The full SSE stream the browser sees:
 
 ```
 event: sources
-data: [{"filename":"...", "page":2, "score":0.87}, ...]
+data: [{"filename":"...", "page":2, "score":0.87, "match":"semantic", ...}, ...]
+
+event: confidence
+data: {"tier":"grounded", "value":0.91, "reason":"strong source overlap (avg 91%)"}
 
 event: token
-data: The fund's expense ratio is
+data: The fund's expense ratio is 0.75% annually...
 
-event: token
-data: 0.75% annually...
+event: chart                 (only when compute_metric ran)
+data: {"chart_spec": {...}, "filename": "...", "op": "..."}
 
 event: done
 data:
 ```
 
-For a chart query, a `chart` event replaces or follows the text events.
+**Confidence tiers** (`main.py::_confidence_for_llm_path` + the threshold bypass path):
+
+| Tier | When | Displayed |
+|---|---|---|
+| `deterministic` | A tool ran, the threshold bypass fired, or all top-3 sources are exact-id matches | Green pill, 100% |
+| `grounded` | Average displayed source score across top-3 ≥ 0.85 | Blue pill, percentage |
+| `semantic` | Otherwise | Grey pill, percentage |
 
 ### 3. Document Deletion (`DELETE /documents/{filename}`)
 
-FAISS does not support in-place deletion. The approach:
+`composite.delete_by_file(filename)` does all four sub-stores:
+1. SQLite `DELETE FROM chunks WHERE file = ?` and collect deleted chunk_ids.
+2. Rebuild text FAISS index keeping only non-deleted vectors (uses `IndexFlatIP.reconstruct()` per kept vector — no re-embedding).
+3. Remove postings from the inverted index that reference deleted chunks.
+4. If a file_id is no longer present in any chunk, drop its `NumericScaler` and (when `enable_numeric_ann`) its numeric FAISS file.
 
-1. Filter `self.metadata` — keep entries where `filename != target`.
-2. Get the index positions of kept entries.
-3. Slice `self._vectors` (raw numpy array stored alongside the FAISS index) to get only kept vectors.
-4. Create a new empty `IndexFlatIP` and `add()` the kept vectors into it.
-5. Save the rebuilt index to disk.
+Then `state.documents`, `state.filename_to_file_id`, and `state.dataframes_by_file_id` get the matching entries cleared.
 
-This avoids re-embedding any documents — the raw vectors are already stored.
+---
+
+## Chunk Schema
+
+`backend/app/rag/schema.py`:
+
+```python
+SCHEMA_VERSION = 2
+
+ChunkType = Literal[
+    "text", "table",
+    "synopsis", "enumeration", "tabular_summary", "row",
+    "entity", "numeric_vector", "time_window",
+]
+
+class ChunkMeta(TypedDict):
+    # 8 mandatory fields — every chunk has these:
+    chunk_id: str            # uuid4 hex
+    file: str                # logical filename, sheet-aware
+    sheet: str | None
+    row_number: int | None
+    chunk_type: ChunkType
+    canonical_id: str | None # entity key; None for prose / synopsis
+    ingestion_time: str      # ISO8601 UTC
+    version: int             # = SCHEMA_VERSION
+    # NotRequired extras populated by specific chunkers:
+    text, page, aliases, column_names, numeric_columns,
+    window, stats, source_chunk_ids, file_id
+```
+
+When `SCHEMA_VERSION` bumps, the migration script wipes the index dir and re-ingests every file in `data/uploads/`. The mandatory eight survive every chunker; the rest depend on type (e.g. `numeric_vector` chunks have no `text` body — `format_context_v2` synthesizes one for the LLM).
+
+---
+
+## Retrieval Pipeline Walkthrough
+
+`retrieve_v2(query, idx, k, plan)` in `retrieval/orchestrator.py`:
+
+1. **Classify intent.** `classify_intent(query)` produces a `Plan` with `intent`, `raw_entity_phrases`, optional `threshold` (op + value), and optional `window`. Intent is a `Literal` over `point_lookup | list_distinct | numeric_threshold | trend | aggregate | qualitative`.
+2. **Resolve canonical_id.** `resolve_canonical_id(plan, idx)` walks the entity phrases longest-first against `aliases.alias_to_canon` and `inverted.lookup_id`, with progressive token trimming.
+3. **Exact-match fan-out.** If `canonical_id` is set, look up all chunks under `id:<canon>`. Cell predicates (`X = Y`) hit `cell:<col>:<val>`.
+4. **Text ANN over-fetch.** Embed the query, retrieve `k × 4` candidates from FAISS.
+5. **Linear rerank.** Score every candidate with `deterministic_score`:
+   ```
+   score = 1.00 × exact_id
+         + 0.40 × exact_cell
+         + 0.50 × text_cosine
+         + 0.30 × (-min(numeric_dist, 9.9) / 10)
+         + 0.20 × type_prior(chunk_type, intent)
+   ```
+6. **Cross-encoder rerank** (optional, on by default). Splits candidates into exact-id and semantic groups. Exact-id stays in linear-score order. The top `ce_top_n` semantic candidates are scored by `cross-encoder/ms-marco-MiniLM-L-6-v2` and re-sorted. Final order: exact-id first, then CE-ranked semantic.
+7. **Return top-k.** Each result carries `_score` (linear) and `_score_breakdown` (`exact_id`, `exact_cell`, `text_sim`, `numeric_dist`, `ce_score`, `intent`, `chunk_type`).
+
+`format_context_v2` then renders `[1] file p.N\nbody` blocks, synthesizing prose for `numeric_vector` and `time_window` chunks that have no text body.
+
+### Source-card confidence (UI mapping)
+
+`_source_card` in `main.py` translates `_score_breakdown` into a 0–1 confidence:
+
+| Signal | Displayed % | Badge |
+|---|---|---|
+| `exact_id == True` | 100% | Green (exact) |
+| `exact_cell == True` | 95% | Blue (field) |
+| else | `text_sim × 100` | Grey (semantic) |
+
+`_score` (the linear ranking score) is preserved on the card as `rank_score` for debugging — it can exceed 1.0.
+
+### Numeric-threshold deterministic bypass
+
+`main.py::_try_numeric_threshold_bypass` runs *before* the LLM call when the intent classifier returns `numeric_threshold` and a column resolves in any loaded tabular file. It calls `analysis/query.py::query_table` with the extracted `(op, value)` directly across every matching file, aggregates results, and returns a complete answer with tier `deterministic`. The LLM is bypassed entirely.
+
+This was added because 7B-class models systematically miscompute numeric comparisons — e.g. claim "no funds have NAV < 100" when several do. Pandas filtering with token-overlap column resolution gives an exact, auditable answer in milliseconds.
+
+The bypass is skipped when the user explicitly chose `mode: "chat"`.
 
 ---
 
 ## Backend — Module Reference
 
-### `app/text.py`
+### `app/main.py`
 
-Universal text normalization run by every parser before chunking. Functions:
+FastAPI app. Routes: `/health`, `/documents`, `/documents/{filename}` (DELETE), `/ingest`, `/chat`. Hosts the threshold-bypass and confidence-tier helpers (`_try_numeric_threshold_bypass`, `_confidence_for_llm_path`, `_source_card`), plus tool gating (`_select_tools`, `_should_enable_tools`).
 
-| Function | Purpose |
-|---|---|
-| `normalize(text)` | NFKC normalize → replace Unicode look-alikes (smart quotes, en/em dashes, NBSPs, BOMs) → dehyphenate line-wrapped words (`expense-\nratio` → `expenseratio`) → strip trailing whitespace before newlines → collapse 3+ newlines to a single paragraph break |
-
-Why it matters: identical content in two different documents (one with smart
-quotes, one with straight quotes) used to embed differently and retrieve
-separately. After normalization they collide on the same vector — better recall
-and smaller index.
-
-### `app/config.py`
-
-Reads `.env` via pydantic-settings. All configuration lives here — never hardcoded elsewhere.
-
-| Setting | Default | Description |
-|---|---|---|
-| `OLLAMA_HOST` | `http://localhost:11434` | Ollama server URL |
-| `OLLAMA_MODEL` | `qwen2.5:7b` | Model name as seen in `ollama list`. Qwen 2.5 is the recommended default for tool-call discipline; Mistral 7B and Llama 3.x also work. |
-| `EMBED_MODEL` | `sentence-transformers/multi-qa-MiniLM-L6-cos-v1` | Embedding model. Asymmetric (query/passage trained) — better at matching short user questions to longer document chunks than the old symmetric `all-MiniLM-L6-v2`. 384-dim, 512-token max — see Pitfalls. |
-| `TOP_K` | `10` | FAISS results per query. Bumped from 5 because per-row chunks dilute relevance — short queries against verbose row strings need more recall headroom. |
-| `CHUNK_TOKENS` | `180` | Words per chunk — well under the embedder's 512-token cap |
-| `CHUNK_OVERLAP` | `40` | Overlap words between chunks |
-| `HISTORY_TURNS` | `4` | Number of conversation turns sent to LLM |
+The `/ingest` endpoint runs PDF post-processing: after the PDF itself is ingested, `extract_pdf_tables_as_csv` writes one CSV per detected table to the upload dir, and each CSV is ingested independently with per-file try/except so one bad table can't kill the rest. Per-CSV results are surfaced in the response as `extracted_tables`.
 
 ### `app/state.py`
 
-Module-level singletons — effectively the application's in-memory database.
-
 ```python
-vector_store          # VectorStore singleton (FAISS + metadata)
-dataframes_by_file_id # {file_id: pd.DataFrame} for tabular files
-filename_to_file_id   # {filename: file_id} for compute_metric lookup
-documents             # {filename: {file_id, type, chunks}} for /documents endpoint
-chat_history          # {session_id: deque(maxlen=history_turns*2)}
+composite: CompositeIndex      # the four-store orchestrator
+dataframes_by_file_id: dict    # {file_id: pd.DataFrame} for tabular files
+filename_to_file_id: dict      # {logical_name: file_id} for tool dispatch
+documents: dict                # {filename: {file_id, type, chunks}} for /documents
+chat_history: dict             # {session_id: deque(maxlen=history_turns*2)}
 ```
 
-`vector_store.load_or_init()` is called once at startup in the FastAPI lifespan (in a thread, as it's blocking file I/O).
+`composite.load_or_init()` is called once at startup in the FastAPI lifespan (in a thread, since `faiss.read_index` and `sqlite3.connect` are blocking).
 
-### `app/rag/vector_store.py`
+### `app/text.py`
 
-Wraps FAISS. Key points:
-
-- Uses `IndexFlatIP` (inner product). Vectors are L2-normalized by the embedder, so inner product equals cosine similarity.
-- Embedding dimension hardcoded to `_EMBED_DIM = 384` so FAISS can initialize at startup without loading the embedding model.
-- `self._vectors` stores raw numpy vectors alongside the FAISS index, enabling rebuild-on-delete without re-embedding.
-- `save()` / `load_or_init()` use `faiss.write_index` + pickle. The pickle stores a `dict` with both `metadata` and `vectors` keys (old format was a plain list — backwards-compat handled in `load_or_init`).
-
-### `app/rag/embedder.py`
-
-- `_model()` is `@lru_cache(maxsize=1)` — SentenceTransformer loads once on first call, cached forever.
-- `embed()` normalizes vectors (`normalize_embeddings=True`) for cosine similarity.
-- `chunk_text()` splits on whitespace and uses word count as a token approximation. Sufficient for this scale.
-
-### `app/parsers/tabular.py`
-
-The most heavily-engineered parser, because tabular data is where the system
-both ingests AND analyzes (via `compute_metric`). Pipeline:
-
-1. **Header-row sniffing** — call `_has_unnamed_columns()` on the row-0 read.
-   If pandas auto-named ≥30% of columns `Unnamed: N`, the real header is below
-   a title/branding row. Scan rows 1–4 for a clean header.
-2. **Multi-sheet handling** — `parse_tabular()` returns a list of dicts. CSV →
-   single entry. Multi-sheet Excel → one entry per non-empty sheet, with
-   `logical_name = "{filename} :: {sheet}"`.
-3. **`_clean()`** — strip column names, normalize null sentinels (`""`, `"-"`,
-   `"N/A"`, etc.), drop fully-empty rows/columns, coerce currency/percent
-   strings to floats, coerce date-named columns to datetime. Coercion is
-   gated by an 80% parse-rate threshold to avoid destroying mostly-text
-   columns.
-4. **`synopsis()`** — descriptive one-paragraph blurb. Goes in as the first
-   chunk per sheet so questions like "what's in fund.csv?" hit a dense,
-   high-information embedding. Distinct from `_summarize()` (stats dump).
-5. **`_summarize()`** — head + tail + middle rows (for files >30 rows),
-   `describe(include="number")`, `value_counts().head(5)` for text columns,
-   min/max for datetime columns. This is what gets embedded as
-   `tabular_summary` chunks.
+Universal Unicode + whitespace normalization run by every parser. Smart quotes/em-dashes → ASCII; NBSP/zero-width/BOM stripping; dehyphenation of line-wrapped words (`expense-\nratio` → `expenseratio`); collapse 3+ newlines to a single paragraph break. Identical content with cosmetic differences (smart vs straight quotes) embeds to the same vector after this pass.
 
 ### `app/parsers/pdf.py`
 
-Per-page extraction with table-aware processing:
+Per-page extraction with table-aware processing.
 
-**Table extraction pipeline** (the `_extract_validated_tables()` function):
-1. **Two-strategy detection.** First try pdfplumber's `lines` strategy
-   (`vertical_strategy="lines"`, `horizontal_strategy="lines"`) — this
-   reliably catches tables with visible ruled borders. If it returns nothing,
-   fall back to the `text` strategy with `min_words_vertical=3` — catches
-   borderless tables aligned by whitespace alone, common in fund factsheets.
-   Only the more reliable result is used (lines wins if both find tables).
-2. **Validation** (`_is_valid_table`) rejects obvious false positives:
-   <2 rows, <2 columns, or >70% empty cells. Stops multi-column page
-   bodies and stray figures from being promoted to "tables".
-3. **Cleaning** (`_clean_table_rows`):
-   - `_clean_cell` strips whitespace, replaces `\r`/`\n` with spaces (folds
-     multi-line cells), and collapses repeated whitespace.
-   - Empty rows AND empty columns are dropped.
-   - Ragged rows are padded to the table's max width with `""`.
-4. **Safety wrappers** — `_find_tables_safe` catches exceptions from
-   `find_tables`/`extract` (exotic PDFs occasionally raise) and silently skips
-   the offending table rather than failing the whole ingestion.
+**Table extraction pipeline** (`_extract_validated_tables`):
+1. **Two-strategy detection.** First try pdfplumber's `lines` strategy (ruled borders); fall back to `text` strategy (whitespace-aligned columns) when lines finds nothing. Lines wins if both find tables.
+2. **Validation** (`_is_valid_table`): rejects <2 rows, <2 cols, or >70% empty cells.
+3. **Cleaning** (`_clean_table_rows`): strip whitespace, fold multi-line cells, drop empty rows/cols, pad ragged rows.
+4. **Safety wrappers** (`_find_tables_safe`): catches exceptions from `find_tables`/`extract` so exotic PDFs don't kill ingestion.
 
-Tables that survive all of the above go through `_table_to_markdown` to become
-standalone chunks. They are NOT merged with surrounding text — table chunks
-have different retrieval semantics than prose.
+`parse_pdf` returns `[{page, text, tables_md, tables}]`. `tables_md` becomes a `table` chunk per page; `tables` (raw rows) is consumed by `extract_pdf_tables_as_csv`.
 
-**Body text processing**:
-- `_detect_boilerplate(pages)` — counts each line's appearance across pages
-  (de-duplicating per-page so a footer appearing twice on the same page
-  counts once). Lines appearing ≥3 distinct pages are header/footer/disclaimer
-  noise; they get stripped before embedding.
-- `_PAGE_NUMBER_RE` — line-level regex catching `Page N`, `Page N of M`,
-  `N / M`, bare numerics. Stripped per line.
-- `text.normalize()` applied last so the de-hyphenation regex sees real
-  newlines.
+`extract_pdf_tables_as_csv(pdf_path, output_dir)` writes one CSV per validated table. The header row is normalized first (`_normalize_table_for_csv`) so empty header cells become `col_1`, `col_2`, … instead of being read as `Unnamed: N` and stripped by `_clean`. Returns the list of generated CSV paths.
 
-**Known limitations** (won't be fixed unless they bite in practice):
-- A table may end up extracted both as a structured chunk AND as flowing
-  text in the body (because pdfplumber's `extract_text()` includes table
-  cells as text). Acceptable redundancy — the table chunk has structure,
-  the text chunk is a fallback.
-- Page-spanning tables get split into two chunks with no link.
-- Multi-column page layouts may still confuse the text strategy on rare
-  pages without ruled lines.
+**Body-text processing** strips boilerplate (`_detect_boilerplate` flags lines on ≥3 distinct pages) and page numbers (`_PAGE_NUMBER_RE`) before applying `text.normalize`.
 
 ### `app/parsers/docx.py`
 
-Preserves structure that the old "flatten to plain text" parser threw away:
+`_iter_body(doc)` walks `doc.element.body.iterchildren()` so paragraphs and tables stay in document order. Heading styles → markdown `#` / `##` / `###`. Tables use the same markdown renderer as PDF tables. `text.normalize` applied last.
 
-- `_iter_body(doc)` walks `doc.element.body.iterchildren()` (raw XML) so
-  paragraphs and tables stay in document order. Looks up the existing wrapped
-  Paragraph/Table objects from `doc.paragraphs` / `doc.tables` by element
-  identity — constructing them ad hoc fails because the wrapper needs a
-  parent with a `.part` attribute.
-- `_heading_level()` reads `paragraph.style.name` and returns `1`–`9` for
-  `Heading 1`–`Heading 9` styles. Rendered as markdown `#` / `##` / `###`
-  prefixes.
-- Tables use the same markdown renderer as PDF tables.
-- `text.normalize()` applied to the full assembled string.
+### `app/parsers/tabular.py`
 
-### `app/llm/ollama_client.py` + `app/llm/tools.py`
+The most heavily-engineered parser, because tabular data is where the system both ingests AND analyzes.
 
-- Two tools are registered: `compute_metric` (aggregations → number / chart) and `query_table` (filter/sort/slice → markdown table). Both target tabular files only.
-- `rewrite_query(message, history)` — non-streaming Ollama call that folds prior conversation context into a self-contained search query. Runs *before* retrieval. The rewritten query is used only to embed and search FAISS; the original message still flows into `build_messages` for generation. Skipped when history is empty; falls back to the original message on any error (degraded retrieval is better than a 500). Adds ~0.5–1.5s latency per chat turn on Qwen 7B.
-- `stream_chat(messages, tools=None)` is a single streaming call. When `tools=None`, no tools are sent to Ollama at all. When `tools=[...]`, the model may emit a tool call in the final chunk; text tokens stream live before that.
-- **Tool selection is gated server-side, not left to the model alone.** Local 7B-class models tend to call any registered tool even for plain-text questions like "summarize the file" (with hallucinated arguments). Qwen 2.5 7B is markedly better at this than Mistral 7B, but the gate stays in place because it costs nothing and protects against regressions when swapping models. The selection logic is `main.py::_select_tools(message, mode)`, which combines:
-  1. **User-chosen mode** (sent in the chat request as `mode: "auto" | "chat" | "aggregate" | "query"`):
-     - `chat` → no tools, regardless of message
-     - `aggregate` → only `compute_metric` exposed (forces it when a tabular file exists)
-     - `query` → only `query_table` exposed
-     - `auto` (default) → keyword-gated (see below)
-  2. **Auto-mode keyword gate** — both tools exposed when the message contains a `_QUANT_KEYWORDS` term (aggregation: `average`, `sum`, `top`, `trend`, `plot`, `highest`, etc.) OR a `_QUERY_KEYWORDS` phrase (row-level: `list all`, `show me`, `find all`, `which fund`, `rows with`, etc.). For all other messages, tools are stripped and the model just streams text.
-  3. **Tabular precondition** — even forced modes return `None` if no CSV/Excel file has been ingested. The chat endpoint additionally short-circuits with a friendly error message in that case, before invoking the LLM.
-- The frontend exposes mode as four pill buttons above the composer (`Auto` / `Chat` / `Calculate` / `Filter`). Default is `Auto`; the user toggles when they notice the model picking the wrong tool.
-- The system prompt explicitly tells the model: aggregations → `compute_metric`, row subsets → `query_table`. The model still occasionally picks the wrong one in `auto` mode; forced modes (`aggregate` / `query`) collapse the choice to a single tool.
+1. **Header-row sniffing** — `_has_unnamed_columns` flags `Unnamed: N` columns at row 0; if ≥30% are unnamed, scans rows 1–4 for a clean header.
+2. **Multi-sheet** — CSV → 1 record; multi-sheet Excel → 1 record per non-empty sheet, `logical_name = "{filename} :: {sheet}"`.
+3. **`_clean`** — strip column names, normalize null sentinels (`""`, `"-"`, `"N/A"`, etc.), drop fully-empty rows/cols, currency/percent → float, date hint → datetime. Coercion is gated by an 80% parse-rate threshold.
+4. **`synopsis`** — descriptive one-paragraph blurb, embedded as a high-recall first chunk.
+5. **`_summarize`** — head + tail + middle rows (for files >30 rows), `describe(include="number")`, `value_counts().head(5)` for text columns, min/max for datetime columns. Goes into `tabular_summary` chunks.
 
-### `app/analysis/metrics.py`
+### `app/chunkers/`
 
-Pure pandas. Supported operations:
-
-| Op | Behavior |
+| Module | Role |
 |---|---|
-| `mean`, `sum`, `count`, `min`, `max` | Scalar or grouped aggregation |
-| `top_n` | `df.nlargest(n, column)` |
-| `trend` | Group by a date/period column, compute mean, sort |
+| `common.py` | `make_meta()` — fills the 8 mandatory `ChunkMeta` fields. |
+| `text_chunker.py` | Sliding-window prose chunks; preserves `doc_header` for context. |
+| `tabular_chunker.py` | Emits `synopsis` + `tabular_summary` + `enumeration` + `row` chunks. Picks the entity-name column heuristically. |
+| `entity_chunker.py` | One chunk per `canonical_id` aggregating all attributes (latest date if time-series). |
+| `numeric_encoder.py` | Builds `numeric_vector` chunks via the per-file `NumericScaler`. No text body. |
+| `timewindow_chunker.py` | `detect_timeseries` + `build_time_windows` (30/90/365d mean/std/min/max + CAGR for 365d). |
 
-### `app/analysis/charts.py`
+### `app/id/canonical.py`
 
-Returns a Plotly figure spec as a plain Python dict (JSON-serializable). Chart type selection:
+`normalize_name()` — idempotent canonicalization. Lowercases, drops `{fund, scheme, plan, the, an, a}`, collapses whitespace. **Keeps `Regular/Direct/Growth/IDCW`** — they distinguish real entities. `AliasMap` — JSON-persisted alias↔canonical map at `data/indexes/aliases.json`, hand-editable.
 
-- `trend` → line chart (scatter with lines+markers)
-- `top_n` or grouped ops → bar chart
-- Scalar (no group_by) → indicator (big number)
+### `app/index/`
 
-### `app/analysis/query.py`
+| Module | Role |
+|---|---|
+| `inverted.py` | Three keyspaces: `id:<canon>`, `cell:<col>:<val>`, `enum:<col>`. JSON persistence. |
+| `text_ann.py` | FAISS `IndexFlatIP`; parallel `chunk_ids` array decouples vector position from metadata. `rebuild_keeping()` for delete. |
+| `numeric_ann.py` | Per-file `IndexFlatL2`. Gated by `enable_numeric_ann`. |
+| `metadata_store.py` | SQLite. Schema: `chunks(chunk_id PK, file, sheet, chunk_type, canonical_id, row_number, ingestion_time, version, file_id, payload)`. Indexes on `(canonical_id, file, chunk_type, file_id)`. |
+| `composite.py` | `CompositeIndex` orchestrator + `IngestItem` dataclass. `add_chunks` / `delete_by_file` / `text_search` / `numeric_search` / `stats`. |
 
-Pure DataFrame query: filter → sort → select_columns → limit. Backs the
-`query_table` LLM tool.
+### `app/rag/`
 
-- **Filter ops**: `==`, `!=`, `>`, `>=`, `<`, `<=`, `contains` (case-insensitive
-  substring), `in` (membership). Numeric comparison values are coerced from
-  strings since LLMs frequently emit `"100"` instead of `100`.
-- **Sort**: takes a column name; `sort_desc=True` by default (most users want
-  "top X" semantics).
-- **Select columns**: any unknown columns are silently dropped from the list;
-  empty list falls back to all columns.
-- **Limit**: defaults to 50; negative values fall back to default.
+| Module | Role |
+|---|---|
+| `schema.py` | `ChunkMeta` `TypedDict`. `SCHEMA_VERSION = 2`. `ChunkType` `Literal`. |
+| `embedder.py` | `multi-qa-MiniLM-L6-cos-v1` — asymmetric (query, passage), 384-dim, L2-normalized output. `_model()` is `@lru_cache(maxsize=1)`. |
+| `numeric_scaler.py` | Per-column z-score. Constant cols get std=1; NaN → 0 post-scale. Save/load to/from JSON. |
+| `retriever.py` | Thin shim over `orchestrator.retrieve_v2` for back-compat. |
 
-Errors (unknown column, unknown op) are raised as `ValueError` and surfaced to
-the user as the assistant message.
+### `app/retrieval/`
+
+| Module | Role |
+|---|---|
+| `router.py` | Rule-based intent classifier. `Intent` `Literal`, `Plan` dataclass. Captures entity phrases via two regexes (structured "of/for/about" + permissive capitalized phrase). |
+| `exact.py` | `resolve_canonical_id` (longest-first + progressive trim) and `extract_cell_predicates`. |
+| `semantic.py` | `text_search` wrapper around `composite.text_search`. |
+| `rerank.py` | `deterministic_score` — hand-tuned linear formula. `_TYPE_PRIOR` table maps `(intent, chunk_type) → [0,1]`. |
+| `cross_encoder.py` | Stage-2 cross-encoder reranker. Lazy-loaded. Skips exact-id chunks. |
+| `orchestrator.py` | `retrieve_v2` — runs the full pipeline. `format_context_v2` — renders chunks for the LLM. |
+
+### `app/llm/`
+
+- **`ollama_client.py`** — Ollama async client. `build_messages`, `rewrite_query` (folds chat history into the search query), `stream_chat` (SSE-friendly).
+- **`tools.py`** — `compute_metric` and `query_table` tool schemas + `SYSTEM_PROMPT`.
+
+`rewrite_query` runs *before* retrieval; the rewritten query is used only to embed and search. The original message still flows into `build_messages` for generation. Skipped when history is empty; falls back to the original message on any error. Adds ~0.5–1.5s latency per chat turn on Qwen 7B.
+
+`stream_chat(messages, tools=None)` is a single streaming call. When `tools=None`, no tools are sent to Ollama. When `tools=[...]`, the model may emit a tool call in the final chunk; text tokens stream live before that.
+
+**Tool selection is gated server-side** (`main.py::_select_tools`). Local 7B-class models tend to call any registered tool with hallucinated arguments; Qwen 2.5 is markedly better but the gate stays in place. Combines:
+
+1. **User-chosen mode** (`mode: "auto" | "chat" | "aggregate" | "query"`):
+   - `chat` → no tools, regardless of message
+   - `aggregate` → only `compute_metric` exposed (forces it when a tabular file exists)
+   - `query` → only `query_table` exposed
+   - `auto` (default) → keyword-gated
+2. **Auto-mode keyword gate** — both tools exposed when the message contains a `_QUANT_KEYWORDS` term (`average`, `sum`, `top`, `trend`, `plot`, `highest`, etc.) OR a `_QUERY_KEYWORDS` phrase (`list all`, `show me`, `find all`, `which fund`, `rows with`, etc.).
+3. **Tabular precondition** — even forced modes return `None` if no CSV/Excel file has been ingested. The chat endpoint short-circuits with a friendly error before the LLM call.
+
+The frontend exposes mode as four pill buttons above the composer (`Auto` / `Chat` / `Calculate` / `Filter`).
+
+### `app/analysis/`
+
+| Module | Role |
+|---|---|
+| `metrics.py` | `compute(df, op, column, group_by, n)` — top/bottom/mean/sum/count/median/min/max grouped or flat. |
+| `query.py` | `query_table` — filter/sort/select on a DataFrame. Filter ops: `==`, `!=`, `>`, `>=`, `<`, `<=`, `contains`, `in`. String→number coercion built-in. Deterministic. |
+| `charts.py` | Plotly figure spec as a plain dict. `trend` → line; `top_n`/grouped → bar; scalar → indicator. |
+| `column_match.py` | Token-overlap column resolver. Drives `_try_numeric_threshold_bypass` so a query phrase like "1-year return" maps to the right column even when phrased differently from the header. |
 
 ---
 
@@ -514,69 +614,137 @@ the user as the assistant message.
 
 ### `src/api/client.ts`
 
-All network calls. The Vite dev server proxies `/api/*` to `http://127.0.0.1:8000` (not `localhost` — see Pitfalls below) so there are no CORS issues in development.
+All network calls. The Vite dev server proxies `/api/*` to `http://127.0.0.1:8000` (not `localhost` — see Pitfalls below).
 
-- `uploadFile(file)` — multipart POST to `/api/ingest`
-- `getDocuments()` — GET `/api/documents`
-- `deleteDocument(filename)` — DELETE `/api/documents/{encoded filename}`
-- `streamChat(sessionId, message, handlers)` — POST `/api/chat`, then reads the response body as a stream. Parses SSE manually (not `EventSource`) because `EventSource` does not support POST requests.
+- `uploadFile(file)` — multipart POST to `/api/ingest`. Returns `IngestResult { filename, chunks, summary, extracted_tables? }`.
+- `getDocuments()` — GET `/api/documents`.
+- `deleteDocument(filename)` — DELETE `/api/documents/{encoded filename}`.
+- `streamChat(sessionId, message, handlers, signal?, mode?)` — POST `/api/chat`, reads response body as a stream. Parses SSE manually (not `EventSource`) because `EventSource` doesn't support POST.
 
 **SSE parsing details (subtle):**
-- Frame separator is `\r?\n\r?\n` (regex). `sse-starlette` emits HTTP-style CRLF (`\r\n\r\n`); a naive split on `\n\n` will silently never match and no events will fire.
-- Per the SSE spec, exactly **one** leading space is stripped from `data:` values — not `trimStart()`, which would collapse leading-space token separators that some local LLMs emit (`" The"`, `" provided"`) into a wall of run-on text.
+- Frame separator is `\r?\n\r?\n` (regex). `sse-starlette` emits HTTP-style CRLF (`\r\n\r\n`); a naive split on `\n\n` will silently never match.
+- Per the SSE spec, exactly **one** leading space is stripped from `data:` values — not `trimStart()`, which would collapse leading-space token separators (`" The"`, `" provided"`) into a wall of run-on text.
 
 ### `src/types.ts`
 
 ```typescript
-Source       // {filename, page, score}
+Source       // {filename, page, type, score, match, rank_score, canonical_id?}
 ChartPayload // {text, chart_spec, filename, op}
-Message      // {role, content, sources?, chart?}
+Confidence   // {tier: "deterministic" | "grounded" | "semantic", value, reason}
+Message      // {role, content, sources?, chart?, confidence?}
 ```
 
 ### `src/App.tsx`
 
-Root layout. Two-column CSS grid: 220px sidebar + flexible chat area. `refreshTick` state is incremented on upload and passed to `DocumentList` as `refreshTrigger` to force a re-fetch.
+Root layout. Two-column CSS grid: 220px sidebar + flexible chat area on desktop; sidebar collapses to a slide-in drawer (hamburger toggle, Escape closes) on screens ≤ 768px. `refreshTick` state is incremented on upload and passed to `DocumentList` as `refreshTrigger` to force a refetch.
 
 ### `src/components/ChatWindow.tsx`
 
-Manages the message list and tool-mode selection. On send:
-
-1. Appends a user message and an empty assistant message to state.
-2. Calls `streamChat(..., mode)` with handlers that mutate the last message in state. `mode` is one of `"auto" | "chat" | "aggregate" | "query"` and is sent in the request body to the backend.
-3. `onToken` appends to `content`. `onSources` sets `sources`. `onChart` sets `chart`.
-4. `onDone` / `onError` set `busy = false`.
-
-The `updateLast` helper always targets the last array element, which is the in-flight assistant message. The mode pills are rendered between the chat scroll area and the composer; they're disabled while the assistant is streaming.
+Manages the message list, mode-pill state, and abort. On send: appends user + empty assistant messages; calls `streamChat(..., mode)` with handlers that mutate the last message in state; mode pills are disabled while streaming. Includes the upload component in the composer; a "Stop" button replaces "Send" while busy.
 
 ### `src/components/MessageBubble.tsx`
 
-Renders one message. If `msg.content` is empty and role is assistant, shows `"…"` as a loading placeholder. Renders `<PlotlyChart>` if `msg.chart` is set, and a collapsible `<details>` for sources.
+Renders one message. Shows `"…"` placeholder for empty assistant content. Renders the confidence badge above the answer (deterministic/grounded/semantic with appropriate color), `<PlotlyChart>` when `msg.chart` is set, and a collapsible `<details>` for sources with per-source match badges (exact / field / semantic).
 
 ### `src/components/DocumentList.tsx`
 
-Fetches `GET /api/documents` on mount and whenever `refreshTrigger` changes. Delete button sets `deleting` state (shows `"…"`) then calls `DELETE /api/documents/{filename}` and re-fetches.
+Fetches `/api/documents` on mount and whenever `refreshTrigger` changes. Delete button shows a `"…"` spinner during the request and re-fetches on success.
+
+### `src/components/FileUpload.tsx`
+
+File picker + status pill. After upload, the status reads e.g. `Indexed 87 chunks (+2 tables from PDF, 1 failed)` so PDF-table extraction success/failure is visible without opening the chat.
+
+### `src/components/PlotlyChart.tsx`
+
+Renders a `ChartPayload` (Plotly JSON spec) inside the bubble. Auto-resizes on viewport changes.
+
+### `src/styles.css`
+
+CSS variables for the dark palette, grid layout, mobile drawer, table rendering inside markdown bubbles. Tables use `display: block` + `overflow-x: auto` + `white-space: nowrap` so wide tables scroll horizontally instead of squeezing cells into vertical character-by-character text.
+
+---
+
+## Endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/health` | Returns chunk counts by type, inverted postings, file list, flags. |
+| `GET` | `/documents` | Lists ingested documents with type and chunk count. |
+| `DELETE` | `/documents/{filename}` | Removes a doc + all its chunks across the four sub-stores. |
+| `POST` | `/ingest` | Multipart file upload → parse → chunk → embed → index. PDFs additionally extract tables as CSV and ingest each. |
+| `POST` | `/chat` | SSE stream of `{event: sources \| confidence \| token \| chart \| done}`. Body: `{session_id, message, mode}` where mode ∈ `auto, chat, aggregate, query`. |
+
+---
+
+## Reranking Knobs
+
+### Linear coefficients (`retrieval/rerank.py`)
+Hand-tuned, deterministic. To change:
+1. Edit `_TYPE_PRIOR` to alter intent ↔ chunk-type preferences.
+2. Edit `deterministic_score` to alter signal weights.
+3. Re-run `pytest backend/tests/test_retrieval_pipeline.py` — the integration tests pin the determinism contract (exact-id always wins).
+
+### Cross-encoder (`retrieval/cross_encoder.py`)
+Default: ON. Set `ENABLE_CROSS_ENCODER=false` in `.env` to disable.
+
+| Knob | Default | Effect |
+|---|---|---|
+| `enable_cross_encoder` | `True` | Master switch. |
+| `cross_encoder_model` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | HF model id. Swappable for `BAAI/bge-reranker-base` (slower, more accurate). |
+| `ce_top_n` | `20` | Max semantic candidates passed to CE per query. |
+
+CE never re-orders exact-id chunks — that preserves the determinism guarantee. CE only acts on the semantic tier.
+
+First call after server start triggers a one-time model download (~90MB) into `~/.cache/huggingface/`. Subsequent calls hit the cache.
+
+---
+
+## Config Flags Reference
+
+`backend/app/config.py` (overridable via `.env` or environment variables):
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `ollama_host` | `http://localhost:11434` | Ollama server URL. |
+| `ollama_model` | `qwen2.5:7b` | Local LLM. |
+| `embed_model` | `sentence-transformers/multi-qa-MiniLM-L6-cos-v1` | Asymmetric (query/passage), 384-dim, max_seq_length=512. |
+| `data_dir` | `./data` | Root for `uploads/` and `indexes/`. |
+| `top_k` | `10` | Retrieved chunks per query. |
+| `chunk_tokens` | `180` | Word-count target per text chunk (~234 tokens; under embedder's 512 cap). |
+| `chunk_overlap` | `40` | Overlap between adjacent text chunks. |
+| `history_turns` | `4` | Chat-history turns folded into `rewrite_query`. |
+| `enable_numeric_ann` | `False` | Build per-file numeric FAISS index at ingest. Off because pandas filtering is faster at our scale. |
+| `enable_cross_encoder` | `True` | Run CE second-stage rerank on the semantic tier. |
+| `cross_encoder_model` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | HF model id for CE. |
+| `ce_top_n` | `20` | Max candidates to score with CE. |
 
 ---
 
 ## Key Design Decisions
 
-**Why FAISS + pickle instead of a vector database?**
-No server process, no Docker, no schema migrations. For a local portfolio demo with O(thousands) of chunks, FAISS with a flat index is instant and correct.
+**Why a CompositeIndex (multi-store) instead of one FAISS index?**
+A single ANN index conflates exact-match identifier lookups, full-text retrieval, and numeric filtering. Splitting them lets each layer use the right primitive: an inverted index for `id:<canonical>`/`cell:<col>:<val>`/`enum:<col>` exact matches (deterministic, sub-millisecond), FAISS for text similarity, and per-file `IndexFlatL2` for numeric vectors when scale demands it.
+
+**Why a numeric-threshold bypass?**
+Local 7B-class models systematically miscompute numeric comparisons — they'll claim "no funds have NAV < 100" even when several do. Routing threshold queries to pandas via `query_table` gives an exact, auditable, instant answer. The bypass is gated by intent classification + column resolution, so non-threshold queries fall through to the LLM normally.
+
+**Why extract PDF tables to CSV in addition to embedding them as markdown?**
+Markdown table chunks make tables retrievable for prose-style questions ("what columns does the holdings table have?") but they don't support `query_table`/`compute_metric`. Writing each detected PDF table as a standalone CSV and ingesting it through the tabular pipeline lets users filter/aggregate over PDF table data the same way they would over a directly-uploaded Excel file.
 
 **Why store raw vectors alongside the FAISS index?**
-FAISS `IndexFlatIP` has no delete operation. Storing raw numpy vectors in the pickle enables rebuild-on-delete without re-reading files or calling the embedding model again.
+FAISS `IndexFlatIP` has no in-place delete. We use `index.reconstruct(i)` to read the kept vectors out and rebuild — no re-embedding required. The metadata SQLite separately maintains the chunk_id ↔ vector-position decoupling so deletes are O(kept) not O(total).
 
 **Why is tool exposure gated by a keyword heuristic?**
-Local 7B-class models have shaky tool-call discipline. With any tool registered, they tend to call it on virtually every question — including "summarize the file" — and hallucinate the required arguments (e.g. `filename="file.csv"`, `column="sales"`). Qwen 2.5 7B is much better at this than Mistral 7B but still not perfect. The tool list is therefore stripped from the Ollama request unless the message looks quantitative *and* a tabular file has been ingested. See `main.py::_should_enable_tools`.
+Local 7B-class models have shaky tool-call discipline — with any tool registered, they tend to call it on virtually every question (including "summarize the file") and hallucinate the required arguments. Qwen 2.5 7B is much better than Mistral 7B but still not perfect. The tool list is stripped from the Ollama request unless the message looks quantitative *and* a tabular file has been ingested. Forced modes (`aggregate`/`query`) bypass the heuristic when the user knows what they want.
 
-**Why manual SSE parsing instead of the browser's `EventSource` API?**
-`EventSource` only supports GET requests. The chat endpoint requires POST (to send session ID and message body). The SSE format is simple enough to parse manually in ~20 lines.
+**Why manual SSE parsing instead of `EventSource`?**
+`EventSource` only supports GET. The chat endpoint requires POST (session ID + message body). The SSE format is simple enough to parse in ~20 lines.
 
-**Why whitespace-based chunking instead of tiktoken?**
-Sufficient for this scale and removes a dependency. The `tiktoken` package is in `requirements.txt` if you want to switch — just replace `chunk_text` in `embedder.py`.
+**Why does the Vite proxy point at `127.0.0.1`, not `localhost`?**
+On Windows, `localhost` resolves to both `::1` (IPv6) and `127.0.0.1` (IPv4). uvicorn binds IPv4 only by default, so Node tries IPv6 first, fails noisily (`AggregateError [ECONNREFUSED]`), then retries IPv4. Hard-coding the IPv4 target skips the lookup.
 
-**Why does Vite proxy point at `127.0.0.1`, not `localhost`?**
-On Windows, `localhost` resolves to both `::1` (IPv6) and `127.0.0.1` (IPv4). uvicorn binds IPv4 only by default, so Node's `net` module tries IPv6 first, fails noisily (`AggregateError [ECONNREFUSED]` from `internalConnectMultiple`), then retries IPv4 and succeeds. Hard-coding the IPv4 target skips the failed-then-retried lookup entirely.
+**Why classify intent on the literal message but retrieve on the rewritten one?**
+The rewriter folds chat history into the search query so follow-ups like "what is its NAV?" find the entity from earlier turns. But the rewriter can hijack broad-intent queries — "List all benchmarks" → "List benchmarks of HDFC Top 100" — flipping `list_distinct` to `point_lookup`. So intent comes from the literal text; entity phrases from the rewritten query are merged in afterwards.
 
 ---
 
@@ -585,40 +753,52 @@ On Windows, `localhost` resolves to both `::1` (IPv6) and `127.0.0.1` (IPv4). uv
 These are the non-obvious traps that the codebase already accounts for. Don't undo them without knowing why.
 
 **Embedder has a 512-token cap.**
-`multi-qa-MiniLM-L6-cos-v1` silently truncates input past `max_seq_length=512`. `CHUNK_TOKENS` is set to 180 words (≈234 tokens), well under the limit. If you swap the embedder, check its `max_seq_length` and update `CHUNK_TOKENS` accordingly.
+`multi-qa-MiniLM-L6-cos-v1` silently truncates input past `max_seq_length=512`. `chunk_tokens` is 180 words (≈234 tokens), well under the limit. If you swap the embedder, check its `max_seq_length` and update `chunk_tokens`.
 
 **Embedder is asymmetric — re-embedding is mandatory if you swap.**
-`multi-qa-MiniLM-L6-cos-v1` is trained on (query, passage) pairs from MS MARCO / NQ — the geometry differs from a symmetric model like `all-MiniLM-L6-v2` even though both are 384-dim. Vectors from one model are not comparable to vectors from another. After changing `EMBED_MODEL`, delete `data/indexes/*.faiss` and `*.pkl` and re-ingest your documents.
+Vectors from `multi-qa-MiniLM-L6-cos-v1` are not comparable to vectors from a symmetric model like `all-MiniLM-L6-v2` even though both are 384-dim. After changing `embed_model`, run `python -m backend.scripts.migrate_v2` to wipe and re-ingest.
 
-**FAISS dimension is hardcoded.**
-`vector_store.py` defines `_EMBED_DIM = 384` so the FAISS index can initialize at startup without loading the (slow) embedding model. If you change `EMBED_MODEL`, also change `_EMBED_DIM` and delete `data/indexes/` — embeddings are model-specific.
+**FAISS dimension is set on the CompositeIndex constructor.**
+`backend/app/state.py` passes `text_dim=384`. If you change `embed_model` to one with a different dim, update that argument and re-migrate. The numeric ANN dimension is per-file (set from the scaler's column count).
 
 **SSE format is CRLF-separated.**
-`sse-starlette` emits `\r\n\r\n` between frames, not `\n\n`. The frontend parser uses `\r?\n\r?\n` regex. Don't switch to `indexOf("\n\n")` — it will silently match nothing and the chat will appear broken with no console errors.
+`sse-starlette` emits `\r\n\r\n`. Frontend uses `\r?\n\r?\n` regex. Don't switch to `indexOf("\n\n")`.
 
 **Leading-space tokens are significant.**
-Some local LLMs emit tokens as `" The"`, `" provided"`, etc. The SSE parser strips one leading space (per spec) from `data:` values. `trimStart()` would collapse those into "Theprovided…".
+The SSE parser strips one leading space (per spec) from `data:` values. `trimStart()` would collapse `" The"` + `" provided"` into "Theprovided…".
 
 **Local LLMs over-call tools.**
-Don't register a tool and assume the system prompt will keep the model from calling it — it won't, even on Qwen 2.5. Gate at the request level: don't send `tools=...` to Ollama unless you've confirmed the question actually warrants it.
+Don't register a tool and assume the system prompt will prevent it from being called. Gate at the request level: don't send `tools=...` to Ollama unless the message warrants it.
 
 **Re-uploading a file appends duplicate chunks.**
-`ingest_file` always assigns a new `file_id` and calls `vector_store.add()`, which appends. Use the delete button in the UI before re-uploading the same file, or you'll get N copies of every chunk. For multi-sheet Excel files, each sheet appears as a separate entry — delete each one before re-uploading.
+`ingest_file` always assigns a new `file_id`. Use the delete button before re-uploading the same file, or run `migrate_v2` to wipe-and-rebuild from `data/uploads/`. For multi-sheet Excel files, each sheet is a separate sidebar entry — delete each before re-uploading.
 
-**Multi-sheet Excel splits one upload into multiple logical files.**
-Uploading `fund.xlsx` with three sheets produces three sidebar entries (`fund.xlsx :: Sheet1`, etc.), three FAISS file_ids, and three DataFrames in `state.dataframes_by_file_id`. The `compute_metric` tool needs the full compound filename. The system prompt includes the list of tabular logical names so the model picks correctly.
+**PDF table extraction may produce CSVs that ingest to zero chunks.**
+A pdfplumber-detected "table" can be a sparse layout where every cell is a null-token. After `parse_tabular::_clean` strips nulls, the dataframe collapses to empty and `parse_tabular` returns `[]`. The endpoint surfaces this in `extracted_tables` with `chunks: 0` — visible in the upload status pill — but the file isn't queryable. `_normalize_table_for_csv` already filters the worst cases (<2 rows / <2 cols / all empty) before writing.
 
 **Header-row sniffing only kicks in when row 0 looks bad.**
-`tabular.py` reads row 0 as the header by default. It only scans rows 1–4 for an alternative if ≥30% of columns came back as `Unnamed: N`. Files where row 0 is wrong but pandas didn't generate Unnamed columns (e.g., row 0 has full numeric values that pandas accepts as column names) won't trigger the fallback. Manually re-save the file with a real header row in that case.
+`tabular.py` only scans rows 1–4 for an alternative header if ≥30% of columns came back as `Unnamed: N`. Files where row 0 is wrong but pandas didn't generate Unnamed columns won't trigger the fallback.
 
 **PDF boilerplate detection needs ≥3 pages.**
-Single-page or 2-page PDFs short-circuit `_detect_boilerplate()` — there's no way to distinguish content from boilerplate without repetition. For short docs the boilerplate stays in the index. The page-number regex still applies regardless.
+Single-page or 2-page PDFs short-circuit `_detect_boilerplate` — there's no way to distinguish content from boilerplate without repetition.
 
 **`_DEHYPHEN_RE` over-merges in rare cases.**
-Words like `co-\nfounder` become `cofounder` because the regex can't tell whether `-\n` was a hard hyphen or a line-wrap artifact. For fund factsheets this is almost always a wrap and the merge is correct, but be aware if you swap to a domain with frequent compound hyphenation.
+Words like `co-\nfounder` become `cofounder` because the regex can't tell whether `-\n` was a hard hyphen or a wrap artifact. For fund factsheets this is almost always a wrap and the merge is correct.
 
-**`state.documents` is in-memory only.**
-After a backend restart, the FAISS index reloads from disk but `state.documents` (which holds chunk counts and file types per filename) is empty until you re-ingest. The `/documents` endpoint will still list filenames (those come from FAISS metadata) but `chunks` and `type` will be undefined.
+**SQLite metadata store — Windows file locking.**
+Stop the uvicorn server before running `migrate_v2`. Otherwise the migration can fail to acquire a write lock on `metadata.sqlite`.
+
+**Snapshot data has no time-window chunks.**
+`detect_timeseries` requires multiple distinct dates per `canonical_id`. Trend queries on single-snapshot data return empty time-window results — by design. Don't fabricate trends from snapshots.
+
+**Cross-encoder is English-only.**
+Fine for current data; revisit if multilingual fund data lands.
+
+**Canonical-id keeps `Regular/Direct/Growth/IDCW`.**
+If users frequently omit those qualifiers, register synonyms in `data/indexes/aliases.json` (the file is hand-editable JSON).
+
+**Numeric ANN is OFF by default.**
+At a few-thousand-row scale, pandas filtering via `query_table` is faster and exact. The schema slot and code path exist for when you grow past ~50k rows; flip `enable_numeric_ann=True` and re-migrate.
 
 ---
 
@@ -626,36 +806,65 @@ After a backend restart, the FAISS index reloads from disk but `state.documents`
 
 ### Support a new file type
 
-1. Add a parser in `backend/app/parsers/yourformat.py` returning text string(s).
+1. Add a parser in `backend/app/parsers/yourformat.py` returning text or a list of records.
 2. Add a branch in `backend/app/ingest.py::ingest_file()` for the new extension.
 3. Add the extension to the `accept` attribute in `frontend/src/components/FileUpload.tsx`.
 
 ### Add a new LLM tool
 
 1. Add the tool schema to `TOOLS` in `backend/app/llm/tools.py`.
-2. Handle the new tool name in `main.py::event_stream()` (the `if tool_call and tool_call["name"] == ...` block).
-3. Update the system prompt if needed so the model knows when to use it.
+2. Handle the tool name in `main.py::event_stream()` (the `if tool_call and tool_call["name"] == ...` block).
+3. Update `_select_tools` and the system prompt if the tool needs gating.
+
+### Add a new chunk type
+
+1. **Schema.** Add the label to `ChunkType` in `rag/schema.py`.
+2. **Chunker.** Create a new file in `app/chunkers/` exporting `build_<type>_chunks(...)` that returns `list[tuple[ChunkMeta, str]]`. Use `make_meta(...)` from `chunkers/common.py`.
+3. **Ingest dispatch.** Wire it into `ingest.py` (`_ingest_tabular_sheet` for tabular files, the top-level `ingest_file` body for prose).
+4. **Inverted keys.** If the chunk should be findable by id/cell/enum, add tuples to `IngestItem.inverted_keys`.
+5. **Type prior.** Add an entry for the new chunk type to `_TYPE_PRIOR` in `rerank.py` for each intent that should surface it.
+6. **Format hook.** If the chunk has no text body, extend `format_context_v2` to synthesize one for the LLM.
+7. **Test.** Add a unit test under `tests/test_chunkers_<type>.py` and an integration assertion in `test_retrieval_pipeline.py`.
+8. **Migrate.** Bump `SCHEMA_VERSION` if existing chunks need re-ingestion. Run `python -m backend.scripts.migrate_v2`.
 
 ### Swap the embedding model
 
-Change `EMBED_MODEL` in `.env`. Also update `_EMBED_DIM` in `backend/app/rag/vector_store.py` to match the new model's output dimension. Delete `data/indexes/` and re-ingest all documents (embeddings are model-specific and incompatible across models).
+Change `embed_model` in `.env`. Update `text_dim` in `backend/app/state.py` to match the new model's output dim. Run `python -m backend.scripts.migrate_v2` to wipe and re-ingest.
 
 ### Swap the LLM
 
-Change `OLLAMA_MODEL` in `.env` to any model available in `ollama list`. Pull it first with `ollama pull <model>`. Models differ in tool-calling quality — Qwen 2.5 7B (recommended default) is materially better than Mistral 7B at emitting structured tool calls instead of describing them in prose; Llama 3.x also works.
+Change `OLLAMA_MODEL` in `.env` to any model in `ollama list` (pull it first with `ollama pull <model>`). Models differ in tool-calling quality — Qwen 2.5 7B is materially better than Mistral 7B at emitting structured tool calls; Llama 3.x also works.
 
 ### Persist chat history across restarts
 
-Currently `state.chat_history` is a `defaultdict` in memory — it resets on server restart. To persist it, serialize it to a JSON file in the lifespan shutdown handler and reload it in `load_or_init`.
+`state.chat_history` is a `defaultdict` in memory — resets on restart. To persist, serialize it to JSON in the lifespan shutdown handler and reload in `load_or_init`.
+
+---
+
+## Migration
+
+When `SCHEMA_VERSION` bumps, the embedder dimension changes, or the on-disk index gets corrupted:
+
+```powershell
+# 1. Stop uvicorn
+# 2. Run the migrator
+python -m backend.scripts.migrate_v2
+# 3. Restart uvicorn
+```
+
+The script:
+1. Wipes `data/indexes/*`.
+2. Initializes a fresh `CompositeIndex`.
+3. Re-ingests every file in `data/uploads/`.
+4. Reports per-file chunk counts grouped by type.
+
+No dual-write, no shadow read. Idempotent.
 
 ---
 
 ## Testing
 
-The pytest suite lives in `backend/tests/` and covers all pure-logic units
-(parsing, cleaning, chunking, vector store, metrics, charts, tool gating).
-HTTP endpoints and Ollama streaming are intentionally not unit-tested —
-the cost/value ratio is poor for an interactive personal-portfolio app.
+The pytest suite covers all pure-logic units (parsing, cleaning, chunking, indexing, retrieval, rerank, metrics, charts, tool gating, threshold bypass, confidence tiers).
 
 ### Run
 
@@ -664,30 +873,41 @@ cd backend
 ../.venv/Scripts/python.exe -m pytest tests/ -v
 ```
 
-(Or just `pytest tests/` after activating the venv.) Cold runs take ~15s
-because importing `app.main` indirectly pulls in faiss + sentence-transformers.
+(Or just `pytest tests/` after activating the venv.) Cold runs take ~90s — importing `app.main` indirectly pulls in faiss + sentence-transformers + the cross-encoder stub.
 
 ### Layout
 
 | Test file | What it locks down |
 |---|---|
-| `test_text_normalize.py` | Smart-quote/em-dash → ASCII, NBSP/zero-width/BOM stripping, dehyphenation, whitespace collapse, paragraph-break preservation |
-| `test_chunking.py` | Empty input, single-chunk, multi-chunk overlap correctness, step-clamp guard against infinite loop |
-| `test_tabular_cleaning.py` | `_clean` (column strip, nulls, drop-empty, currency/percent coercion, 80% threshold, date hint), `parse_tabular` (CSV roundtrip, single + multi-sheet Excel, header sniffing, summary contents), `synopsis` |
-| `test_pdf_helpers.py` | `_table_to_markdown`, `_clean_table_rows` (whitespace, multi-line cells, empty rows/cols, ragged rows, None handling), `_is_valid_table` (size/empty thresholds), `_detect_boilerplate`, `_strip_boilerplate` |
-| `test_docx_parser.py` | Heading rendering, table rendering, empty paragraph skipping, document order preservation, Unicode normalization |
-| `test_metrics.py` | All ops (mean/sum/top_n/trend), group-by paths, error paths |
-| `test_charts.py` | All chart types, top_n label-column auto-pick (regression test for the broken-x-axis fix) |
-| `test_query.py` | All filter ops (`==`/`!=`/`>`/`>=`/`<`/`<=`/`contains`/`in`), string-to-number coercion, sort ordering, column selection, multi-filter chaining, error paths |
-| `test_tool_gating.py` | `_should_enable_tools` keyword gating, plus `_select_tools` mode-override logic for `auto` / `chat` / `aggregate` / `query`, including the "no tabular files" short-circuit for forced modes |
-| `test_retriever.py` | `format_context` formatting + edge cases |
-| `test_vector_store.py` | Empty search, add+search, save/reload roundtrip, dedupe filename listing, delete-by-filename |
-| `test_tool_gating.py` | `_should_enable_tools` keyword + state-based gating |
+| `test_text_normalize.py` | Smart-quote/em-dash → ASCII, NBSP/zero-width/BOM stripping, dehyphenation, whitespace collapse. |
+| `test_chunking.py` | `chunk_text` empty/single/multi-chunk + step-clamp guard. |
+| `test_tabular_cleaning.py` | `_clean` (column strip, nulls, drop-empty, currency/percent coercion, 80% threshold, date hint). `parse_tabular` (CSV roundtrip, single + multi-sheet Excel, header sniffing). `synopsis`. |
+| `test_pdf_helpers.py` | `_table_to_markdown`, `_clean_table_rows`, `_is_valid_table`, `_detect_boilerplate`, `_strip_boilerplate`. |
+| `test_docx_parser.py` | Heading rendering, table rendering, document order preservation, Unicode normalization. |
+| `test_canonical.py` | `normalize_name` idempotency + punctuation invariance. `AliasMap` roundtrip. |
+| `test_chunkers_tabular.py` | Row chunks carry `canonical_id`; entity chunks list aliases; enumeration completeness. |
+| `test_inverted_index.py` | id/cell/enum lookup; case-insensitive cell match; JSON roundtrip. |
+| `test_metadata_store.py` | Upsert + get_many; delete_by_file; by_canonical ordering. |
+| `test_numeric_scaler.py` | Constant-column safety, NaN handling, save/load equality. |
+| `test_text_ann.py` | Empty search, add+search, save/reload roundtrip. |
+| `test_timewindow.py` | Single-date returns None; multi-date builds 30/90/365; CAGR matches manual calc within 1e-6. |
+| `test_retrieval_pipeline.py` | Integration: point lookup top-1 = right canonical_id; list-distinct top-1 = enumeration chunk; numeric threshold returns rows satisfying predicate; trend returns time_window chunks. |
+| `test_retriever.py` | `format_context_v2` formatting + edge cases. |
+| `test_cross_encoder.py` | CE rerank with stub model (token-overlap heuristic — no network required). |
+| `test_metrics.py` | All ops (mean/sum/top_n/trend), group-by paths, error paths. |
+| `test_charts.py` | All chart types, top_n label-column auto-pick. |
+| `test_query.py` | All filter ops, string→number coercion, sort ordering, multi-filter chaining. |
+| `test_column_match.py` | `resolve_column` token-overlap matching. |
+| `test_tool_gating.py` | `_should_enable_tools` + `_select_tools` mode-override logic. |
+| `test_threshold_bypass.py` | `_try_numeric_threshold_bypass` deterministic path: AUM/NAV thresholds, multi-file aggregation, source-file column on multi-file results, zero-match messaging, fallthrough conditions. `_confidence_for_llm_path` tier assignment. |
+| `test_source_card.py` | `_source_card` mapping from `_score_breakdown` to displayed match badge. |
+
+The cross-encoder tests use a stub model so they run without network. The real CE is exercised by manual end-to-end testing.
 
 ### Known benign warnings
 
-Three `DeprecationWarning: builtin type SwigPyPacked has no __module__ attribute`
-messages come from FAISS's SWIG bindings on import. They aren't from project
-code and are out of our control. The dateutil "Could not infer format" warning
-in tabular tests comes from `pd.to_datetime(errors="coerce")` doing best-effort
-parsing, which is exactly what we want.
+Three `DeprecationWarning: builtin type SwigPyPacked has no __module__ attribute` messages come from FAISS's SWIG bindings on import — out of our control. The dateutil "Could not infer format" warning in tabular tests comes from `pd.to_datetime(errors="coerce")` doing best-effort parsing, which is exactly what we want.
+
+### Demo notebook
+
+`backend/notebooks/demo_v2.ipynb` walks each retrieval intent (point_lookup, list_distinct, aggregate, threshold, trend) showing the router output, candidate set, and score breakdown.

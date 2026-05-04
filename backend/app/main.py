@@ -138,22 +138,64 @@ async def ingest(file: UploadFile = File(...)) -> dict:
         shutil.copyfileobj(file.file, f)
     try:
         result = await asyncio.to_thread(ingest_file, dest, file.filename)
-
-        # If it's a PDF, also extract and ingest any tables as CSV.
-        if dest.suffix.lower() == ".pdf":
-            try:
-                csv_paths = await asyncio.to_thread(
-                    extract_pdf_tables_as_csv, dest, settings.upload_dir
-                )
-                for csv_path in csv_paths:
-                    await asyncio.to_thread(ingest_file, csv_path, csv_path.name)
-            except Exception as e:
-                # Table extraction failure is not fatal; log but don't fail.
-                print(f"Warning: PDF table extraction failed for {file.filename}: {e}")
-
-        return result
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+    if dest.suffix.lower() != ".pdf":
+        return result
+
+    # PDF post-processing: extract any tables as CSV and ingest each as a
+    # tabular file. We isolate per-CSV failures so one bad table can't suppress
+    # the rest, and we surface every attempt in the response so the UI/upload
+    # status can show what landed and what didn't.
+    extracted: list[dict] = []
+    try:
+        csv_paths = await asyncio.to_thread(
+            extract_pdf_tables_as_csv, dest, settings.upload_dir
+        )
+    except Exception as e:
+        print(f"[ingest] PDF table extraction crashed for {file.filename}: {e}")
+        csv_paths = []
+
+    total_table_chunks = 0
+    summary_lines: list[str] = []
+    for csv_path in csv_paths:
+        try:
+            csv_result = await asyncio.to_thread(
+                ingest_file, csv_path, csv_path.name
+            )
+        except Exception as e:
+            extracted.append(
+                {"filename": csv_path.name, "chunks": 0, "error": str(e)}
+            )
+            print(f"[ingest] CSV ingest failed for {csv_path.name}: {e}")
+            continue
+        extracted.append(
+            {"filename": csv_path.name, "chunks": csv_result["chunks"]}
+        )
+        total_table_chunks += csv_result["chunks"]
+        if csv_result["chunks"] > 0:
+            summary_lines.append(
+                f"- `{csv_path.name}` — {csv_result['chunks']} chunks"
+            )
+        else:
+            # Tabular pipeline accepted the CSV but produced nothing — usually
+            # means parse_tabular dropped every row as empty after cleaning.
+            summary_lines.append(
+                f"- `{csv_path.name}` — 0 chunks (cleaned to empty; not queryable)"
+            )
+
+    if extracted:
+        result = dict(result)
+        result["chunks"] = result.get("chunks", 0) + total_table_chunks
+        result["extracted_tables"] = extracted
+        if summary_lines:
+            existing = result.get("summary", "")
+            joined = "\n".join(summary_lines)
+            header = f"\n\nExtracted {len(extracted)} table(s) from PDF:\n"
+            result["summary"] = (existing + header + joined).strip()
+
+    return result
 
 
 class ChatRequest(BaseModel):

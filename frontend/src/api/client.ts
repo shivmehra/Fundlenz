@@ -14,10 +14,17 @@ export interface DocumentInfo {
   chunks?: number;
 }
 
+export interface ExtractedTable {
+  filename: string;
+  chunks: number;
+  error?: string;
+}
+
 export interface IngestResult {
   filename: string;
   chunks: number;
   summary: string;
+  extracted_tables?: ExtractedTable[];
 }
 
 export type ChatMode = "auto" | "chat" | "aggregate" | "query";
