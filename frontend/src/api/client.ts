@@ -43,6 +43,27 @@ export async function getDocuments(): Promise<DocumentInfo[]> {
   return res.json();
 }
 
+export interface Settings {
+  enable_numeric_ann: boolean;
+  enable_cross_encoder: boolean;
+}
+
+export async function getSettings(): Promise<Settings> {
+  const res = await fetch("/api/settings");
+  if (!res.ok) throw new Error("Failed to fetch settings");
+  return res.json();
+}
+
+export async function updateSettings(patch: Partial<Settings>): Promise<Settings> {
+  const res = await fetch("/api/settings", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) throw new Error("Failed to update settings");
+  return res.json();
+}
+
 export async function deleteDocument(filename: string): Promise<void> {
   const res = await fetch(`/api/documents/${encodeURIComponent(filename)}`, { method: "DELETE" });
   if (!res.ok) throw new Error(`Delete failed: ${res.status}`);

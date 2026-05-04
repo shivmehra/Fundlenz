@@ -424,6 +424,127 @@ label.upload {
 label.upload:hover { filter: brightness(1.1); }
 label.upload input { display: none; }
 
+/* ── Sidebar settings section ── */
+
+.settings-section {
+  margin-top: auto;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.settings-title {
+  margin: 0 0 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 0;
+}
+
+.toggle-row + .toggle-row {
+  border-top: 1px dashed rgba(48, 54, 61, 0.6);
+}
+
+.toggle-label-text {
+  font-size: 12px;
+  color: var(--text);
+  flex: 1;
+}
+
+/* ── Tooltip ── */
+
+.tooltip-anchor {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  font-size: 11px;
+  color: var(--muted);
+  cursor: help;
+  flex-shrink: 0;
+}
+
+.tooltip-anchor .tooltip-text {
+  display: none;
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 8px);
+  transform: translateX(-50%);
+  width: 210px;
+  background: #21262d;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--text);
+  z-index: 200;
+  pointer-events: none;
+  white-space: normal;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+}
+
+.tooltip-anchor:hover .tooltip-text {
+  display: block;
+}
+
+/* ── Toggle switch ── */
+
+.toggle-switch {
+  position: relative;
+  display: inline-block;
+  width: 32px;
+  height: 18px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.toggle-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+  position: absolute;
+}
+
+.toggle-slider {
+  position: absolute;
+  inset: 0;
+  background: #30363d;
+  border-radius: 18px;
+  transition: background 0.2s;
+}
+
+.toggle-slider::before {
+  content: "";
+  position: absolute;
+  height: 12px;
+  width: 12px;
+  left: 3px;
+  top: 3px;
+  background: #8b949e;
+  border-radius: 50%;
+  transition: transform 0.2s, background 0.2s;
+}
+
+.toggle-switch input:checked + .toggle-slider {
+  background: rgba(88, 166, 255, 0.25);
+  border: 1px solid var(--accent);
+}
+
+.toggle-switch input:checked + .toggle-slider::before {
+  transform: translateX(14px);
+  background: var(--accent);
+}
+
 .sidebar-backdrop { display: none; }
 
 /* ── Mobile (≤ 768px): sidebar collapses to slide-in drawer ── */

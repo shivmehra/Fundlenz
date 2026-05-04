@@ -276,7 +276,11 @@ state.composite.save() → text.faiss, inverted.json, metadata.sqlite, scaler_*.
 
 After the PDF itself is ingested, `parsers/pdf.py::extract_pdf_tables_as_csv` runs over every detected table and writes a CSV per table to `data/uploads/{pdf_stem}_page{N}_table{M}.csv`. Each CSV is then ingested independently via `ingest_file(csv_path, csv_path.name)` so the table data flows into the tabular pipeline (synopsis/enumeration/row/entity/numeric_vector chunks) and becomes queryable through `query_table` and `compute_metric`.
 
-The table-to-CSV writer normalizes the header row first (`_normalize_table_for_csv`): empty header cells get `col_1`, `col_2`, … placeholders, duplicate names get `_2` suffixes, ragged rows are padded, and degenerate tables (<2 rows / <2 cols / all empty) are skipped. Without this, pandas would read empty headers as `Unnamed: N`, `_clean` would strip them as junk, and the dataframe would collapse to empty silently.
+The table-to-CSV writer normalizes the header row first (`_normalize_table_for_csv`) in three steps:
+
+1. **Strip sparse top rows.** PDF tables often have a row 0 that is just the entity name or a section label spanning the full width (one filled cell, the rest blank), with the real column headers in row 1. Up to 3 such rows are peeled off the top — the strip continues while row 0 is less-than-half filled AND row 1 has more filled cells than row 0. Without this, pandas reads the title row as the header, the real headers land as a string-typed data row, numeric coercion fails on the mixed-type column, and `compute_metric`/`query_table` are useless on the result.
+2. **Conditionally fill blank header cells.** Only when the (possibly post-strip) row 0 is ≥50% filled, blanks become `col_1`, `col_2`, … placeholders. When row 0 is still sparse, blanks are left as-is so pandas auto-names them `Unnamed: N` and the existing `tabular.py` row-1-to-4 fallback can find the real header.
+3. **De-duplicate names** so pandas doesn't silently collapse repeated columns. Degenerate tables (<2 rows / <2 cols / all empty) are skipped entirely.
 
 The `/ingest` response surfaces what landed:
 
@@ -515,7 +519,7 @@ Per-page extraction with table-aware processing.
 
 `parse_pdf` returns `[{page, text, tables_md, tables}]`. `tables_md` becomes a `table` chunk per page; `tables` (raw rows) is consumed by `extract_pdf_tables_as_csv`.
 
-`extract_pdf_tables_as_csv(pdf_path, output_dir)` writes one CSV per validated table. The header row is normalized first (`_normalize_table_for_csv`) so empty header cells become `col_1`, `col_2`, … instead of being read as `Unnamed: N` and stripped by `_clean`. Returns the list of generated CSV paths.
+`extract_pdf_tables_as_csv(pdf_path, output_dir)` writes one CSV per validated table. Each table goes through `_normalize_table_for_csv` first: sparse "title / group label" rows on top get stripped (up to 3 iterations, while row 0 is <50% filled and row 1 is denser), then header blanks are conditionally filled with `col_<i>` placeholders only if the resulting row 0 is dense enough to actually be a header. When it isn't, blanks are left so pandas-side `Unnamed: N` detection in `tabular.py` can take over. Returns the list of generated CSV paths.
 
 **Body-text processing** strips boilerplate (`_detect_boilerplate` flags lines on ≥3 distinct pages) and page numbers (`_PAGE_NUMBER_RE`) before applying `text.normalize`.
 
@@ -774,10 +778,10 @@ Don't register a tool and assume the system prompt will prevent it from being ca
 `ingest_file` always assigns a new `file_id`. Use the delete button before re-uploading the same file, or run `migrate_v2` to wipe-and-rebuild from `data/uploads/`. For multi-sheet Excel files, each sheet is a separate sidebar entry — delete each before re-uploading.
 
 **PDF table extraction may produce CSVs that ingest to zero chunks.**
-A pdfplumber-detected "table" can be a sparse layout where every cell is a null-token. After `parse_tabular::_clean` strips nulls, the dataframe collapses to empty and `parse_tabular` returns `[]`. The endpoint surfaces this in `extracted_tables` with `chunks: 0` — visible in the upload status pill — but the file isn't queryable. `_normalize_table_for_csv` already filters the worst cases (<2 rows / <2 cols / all empty) before writing.
+A pdfplumber-detected "table" can be a sparse layout where every cell is a null-token. After `parse_tabular::_clean` strips nulls, the dataframe collapses to empty and `parse_tabular` returns `[]`. The endpoint surfaces this in `extracted_tables` with `chunks: 0` — visible in the upload status pill — but the file isn't queryable. `_normalize_table_for_csv` already filters the worst cases (<2 rows / <2 cols / all empty) before writing, and strips up to 3 sparse top rows (entity-name spans, group labels) so the real header lands at row 0 of the CSV.
 
-**Header-row sniffing only kicks in when row 0 looks bad.**
-`tabular.py` only scans rows 1–4 for an alternative header if ≥30% of columns came back as `Unnamed: N`. Files where row 0 is wrong but pandas didn't generate Unnamed columns won't trigger the fallback.
+**Header-row sniffing in `tabular.py` only kicks in when row 0 looks bad.**
+The fallback that scans rows 1–4 only fires when ≥30% of columns came back as `Unnamed: N`. For PDF-extracted CSVs, `_normalize_table_for_csv` works *with* this fallback rather than around it: it fills blanks (suppressing the fallback) only when row 0 is dense enough to be a header, and otherwise leaves blanks (letting the fallback fire and find the real header). For directly-uploaded CSV/Excel files where row 0 is wrong but pandas didn't generate Unnamed columns (e.g. a numeric title row pandas accepts as column names), the fallback won't trigger — manually re-save with a real header row in that case.
 
 **PDF boilerplate detection needs ≥3 pages.**
 Single-page or 2-page PDFs short-circuit `_detect_boilerplate` — there's no way to distinguish content from boilerplate without repetition.

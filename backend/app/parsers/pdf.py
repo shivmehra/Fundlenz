@@ -106,13 +106,29 @@ def extract_pdf_tables_as_csv(pdf_path: Path, output_dir: Path | None = None) ->
 
 
 def _normalize_table_for_csv(table: list[list[str]]) -> list[list[str]] | None:
-    """Return a copy of `table` with header cells filled in (`col_1`, `col_2`,
-    ...), de-duplicated header names, and a guarantee of at least one data row.
+    """Prepare a pdfplumber-extracted table for CSV writing so the downstream
+    tabular pipeline sees a usable header.
+
+    Two structural problems show up in real PDFs:
+
+    1. Row 0 is a "title / group label" — a single cell (e.g. the fund name
+       or a section label like "Performance") spanning the full table width,
+       with the real column headers in row 1. If we write this verbatim,
+       pandas treats the title row as the header and the real headers land as
+       a string-typed data row, killing numeric coercion. We strip up to 3
+       such rows from the top: while row 0 is less-than-half filled AND row 1
+       has more filled cells than row 0.
+
+    2. Row 0 is the header but has a few blank cells. If left blank, pandas
+       names them `Unnamed: N` — fine in isolation, but mixed signals when
+       cases (1) and (2) coexist. We fill blanks with `col_<i>` after the
+       sparse-row strip, then de-duplicate names so pandas doesn't silently
+       collapse repeated columns.
 
     Returns None when the table is too degenerate to be worth writing — fewer
-    than 2 rows, fewer than 2 columns, or every cell empty. Without this, PDFs
-    with stray 2x1 'tables' produce CSV files that pandas reads as empty,
-    `parse_tabular` returns `[]`, and `ingest_file` silently registers nothing.
+    than 2 rows, fewer than 2 columns, or every cell empty. Without that
+    floor, stray 2x1 'tables' produce CSV files that `parse_tabular` reads as
+    empty, returns `[]`, and `ingest_file` silently registers nothing.
     """
     if not table or len(table) < 2:
         return None
@@ -126,17 +142,42 @@ def _normalize_table_for_csv(table: list[list[str]]) -> list[list[str]] | None:
     if not any(any(c.strip() for c in r) for r in rows):
         return None
 
+    def _filled(r: list[str]) -> int:
+        return sum(1 for c in r if c.strip())
+
+    # Strip sparse top rows. Capped at 3 iterations so a stack of group-label
+    # rows can be peeled, but actual data rows can't be eaten if the table is
+    # genuinely sparse all the way down.
+    for _ in range(3):
+        if len(rows) <= 2:
+            break
+        if _filled(rows[0]) * 2 >= n_cols:
+            break
+        if _filled(rows[1]) <= _filled(rows[0]):
+            break
+        rows = rows[1:]
+
+    # Fill blank header cells with `col_<i>` only when row 0 looks dense enough
+    # to actually BE the header (≥50% filled). When it's still sparse — e.g.
+    # multi-stacked title rows that the strip loop couldn't fully peel — leave
+    # blanks so pandas auto-names them `Unnamed: N`, which lets the existing
+    # `_has_unnamed_columns` fallback in tabular.py scan rows 1–4 for a real
+    # header. Always dedupe non-blank names so pandas doesn't silently collapse
+    # repeated columns.
     header = rows[0]
+    header_filled = sum(1 for c in header if c.strip())
+    fill_blanks = header_filled * 2 >= n_cols
+
     seen: dict[str, int] = {}
     fixed_header: list[str] = []
     for i, cell in enumerate(header):
         name = (cell or "").strip()
-        if not name:
+        if not name and fill_blanks:
             name = f"col_{i + 1}"
-        if name in seen:
+        if name and name in seen:
             seen[name] += 1
             name = f"{name}_{seen[name]}"
-        else:
+        elif name:
             seen[name] = 1
         fixed_header.append(name)
     rows[0] = fixed_header

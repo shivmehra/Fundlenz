@@ -96,6 +96,32 @@ app.add_middleware(
 )
 
 
+class SettingsPatch(BaseModel):
+    enable_numeric_ann: bool | None = None
+    enable_cross_encoder: bool | None = None
+
+
+def _settings_snapshot() -> dict:
+    return {
+        "enable_numeric_ann": state.composite.enable_numeric_ann,
+        "enable_cross_encoder": settings.enable_cross_encoder,
+    }
+
+
+@app.get("/settings")
+def get_settings() -> dict:
+    return _settings_snapshot()
+
+
+@app.patch("/settings")
+def patch_settings(body: SettingsPatch) -> dict:
+    if body.enable_numeric_ann is not None:
+        state.composite.enable_numeric_ann = body.enable_numeric_ann
+    if body.enable_cross_encoder is not None:
+        settings.enable_cross_encoder = body.enable_cross_encoder
+    return _settings_snapshot()
+
+
 @app.get("/health")
 def health() -> dict:
     stats = state.composite.stats()
