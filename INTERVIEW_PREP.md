@@ -252,7 +252,34 @@ score = 1.00 * exact_id_match
 
 ---
 
-## 11. LLM Provider Abstraction — pluggable backend
+## 11. Capacity Tracking — RAM headroom + persistent row count
+
+A small but interview-worthy operational polish: after every upload, the sidebar shows total indexed rows and how much RAM is left on the machine.
+
+### Two independent backends, one card
+
+**Row count** lives in SQLite. New `file_stats` table in the existing `metadata.sqlite`: `(file_id PK, filename, row_count, ingestion_time)`. Written at ingest by `ingest.py`; cascade-deleted by `composite.delete_by_file`. Survives a backend restart **even though the DataFrames in `state.dataframes_by_file_id` don't** — so the count stays honest across the very common "restart, don't immediately re-upload" flow.
+
+**RAM** is computed live by `psutil.virtual_memory()` plus `psutil.Process().memory_info().rss`. Cheap (~1ms) — safe to hit on every refresh.
+
+Both are exposed by one endpoint: `GET /stats` returns `{ram: {process_rss_bytes, system_available_bytes, system_total_bytes, system_percent_used}, rows: {total_tabular_rows}}`.
+
+### Why RAM and not disk
+
+**Talking point:** *"The actual ceiling on this app is RAM, not disk. The FAISS index and all the ingested DataFrames live in process memory. When RAM fills up the OS starts swapping and the whole pipeline slows down. Disk is essentially infinite by comparison on a modern laptop. So I show available RAM with a colour signal — amber at 75% used, red at 90% — but I never block ingestion. The user gets a warning, then makes their own call."*
+
+### Why persist in SQLite, not in `state.documents`
+
+**Talking point:** *"The DataFrames don't survive a restart — only the index on disk does. If I computed row count from `state.dataframes_by_file_id` it would read zero every time the backend rebooted, even though the indexes on disk still have those rows. That's a confusing UX. Storing the count in SQLite costs me one tiny extra row per file and gives me a stat that's consistent with what's actually queryable."*
+
+### What's not done (honest)
+
+- Disk-usage tracking — not shown. If a user uploads enough PDFs to fill the data partition, they'll see disk-full errors from the OS, not from the app.
+- Per-file RAM accounting — Fundlenz's RSS includes the loaded embedder + cross-encoder weights (~150 MB combined), not just the DataFrames. The number is honest about Fundlenz's footprint but doesn't break out "DataFrames vs models."
+
+---
+
+## 12. LLM Provider Abstraction — pluggable backend
 
 **The shape of the problem:** local LLMs are free and private but plateau around 7B-class quality. Cloud LLMs are more capable but cost money and leak data. A real product needs both — local as the default, cloud as the opt-in.
 
@@ -300,9 +327,9 @@ Small UX detail with a reason: the header shows `Local: qwen2.5:7b` or `Anthropi
 
 ---
 
-## 12. The User-Facing Settings Toggles
+## 13. The User-Facing Settings Toggles
 
-Three runtime-configurable settings, exposed in the sidebar with click-pinned info tooltips:
+Three runtime-configurable settings, exposed in the sidebar with click-pinned info tooltips (the Capacity card from §11 lives just above them):
 
 1. **Numeric ANN** (`enable_numeric_ann`, default `false`)
    - Tooltip: "Enable when you have 50,000+ rows..."
@@ -322,7 +349,7 @@ Three runtime-configurable settings, exposed in the sidebar with click-pinned in
 
 ---
 
-## 13. Demo Script — Questions to Ask the Chatbot
+## 14. Demo Script — Questions to Ask the Chatbot
 
 Pick 3–4 of these depending on time. Each one demonstrates a different capability of the pipeline.
 
@@ -344,6 +371,7 @@ Pick 3–4 of these depending on time. Each one demonstrates a different capabil
 | 7 | **"What is the AUM of HDFC Top 100?"** (omitting Direct/Growth qualifiers) | Alias-map resolution; if it fails on first try, demonstrates how `aliases.json` would be edited |
 | 8 | **Re-upload the same Excel file** (UI action) | Deduplication: chunk count in `/health` stays flat; on a freshly-loaded indexed file, confirms hash skip |
 | 8b | **Switch LLM provider mid-demo** (sidebar: pick Anthropic, paste key, Save, ask the same Tier-A question) | Pluggability — header badge flips from `Local: qwen2.5` to `Anthropic: claude-sonnet-4-6`; answer quality lift visible on qualitative prompts. Same prompt, different generation backend. |
+| 8c | **Upload an Excel, watch the Capacity card** (point at the sidebar) | StatsCard refreshes: `Total rows` jumps by the row count of the file; `Fundlenz` RSS ticks up; `RAM free` drops. Then restart the backend, refresh — `Total rows` is still correct (persisted in SQLite). Shows operational visibility, not just functional. |
 
 ### Tier C — show the honest limits
 
@@ -361,7 +389,7 @@ Pick 3–4 of these depending on time. Each one demonstrates a different capabil
 
 ---
 
-## 14. Anticipated Interview Questions — short answers
+## 15. Anticipated Interview Questions — short answers
 
 **Q: Why default to local LLM instead of GPT-4 / Claude?**
 *"Cost predictability, no data egress, and the chatbot works for any user the moment they clone the repo — no API keys, no credit card. Quality on the 7B model is acceptable for retrieval-grounded answers because most of the heavy lifting is in retrieval, not generation. But I also wired in cloud routing: a user can paste an Anthropic or OpenAI key in the UI and the next message goes through that provider. It's a per-session, browser-local choice — the backend has no persistent secret state. So the default is private and free, and the opt-in is one paste away."*
@@ -395,7 +423,7 @@ Pick 3–4 of these depending on time. Each one demonstrates a different capabil
 
 ---
 
-## 15. Architecture Diagram (talk-through)
+## 16. Architecture Diagram (talk-through)
 
 ```
                    FRONTEND (React + Vite)
@@ -405,15 +433,15 @@ Pick 3–4 of these depending on time. Each one demonstrates a different capabil
                           ▼
                    FastAPI + SSE
                           │
-        ┌─────────────────┼──────────────────┐
-        │                 │                  │
-   ingest_file()     /chat handler      /settings PATCH
-        │                 │                  │
-        │           rewrite_query()           │
-        │           classify_intent()         │
-        │           retrieve_v2()             │
-        │                 │                  │
-        ▼                 ▼                  ▼
+        ┌─────────┬───────┴──────┬────────┬─────────┐
+        │         │              │        │         │
+   ingest_file() /chat handler  /settings /stats  /llm/local
+        │         │              │        │         │
+        │   rewrite_query()      │   psutil + meta  │
+        │   classify_intent()    │   .total_rows()  │
+        │   retrieve_v2()        │                  │
+        │         │              │                  │
+        ▼         ▼              ▼                  ▼
                    CompositeIndex
         ┌──────────┬──────────┬──────────┬──────────┐
         │ TextANN  │ Inverted │  Meta    │ NumericANN│
@@ -443,7 +471,7 @@ Pick 3–4 of these depending on time. Each one demonstrates a different capabil
 
 ---
 
-## 16. The Honest Trade-offs (mention these unprompted — shows maturity)
+## 17. The Honest Trade-offs (mention these unprompted — shows maturity)
 
 1. **Per-row chunks bloat the index** — 200-row Excel becomes ~410 chunks. Fine on a laptop, would matter at 100× scale.
 2. **Numeric ANN is overkill at current scale** — pandas is faster and exact. Code path exists; flag is off.
@@ -453,6 +481,7 @@ Pick 3–4 of these depending on time. Each one demonstrates a different capabil
 6. **SQLite Windows file-locking risk** during concurrent ingest + read. Mitigation: stop server before bulk migration.
 7. **Time-window chunks need actual time-series data** — snapshot files don't get them. By design — no fabricated trends.
 8. **Cloud-LLM API key travels in the `/chat` request body** — fine on localhost (no network hop), but if I ever exposed this backend over a network I'd need TLS to keep the key off the wire. The backend never persists it, but it does briefly hold it in process memory during the API call.
+9. **Capacity tracks RAM, not disk.** Disk fills up rarely on a modern laptop; RAM is the real ceiling because DataFrames + FAISS sit in process memory. If a user did fill the data partition, they'd see a disk-full OSError, not a graceful "out of capacity" message. Acceptable for a local app; would need both indicators if this ever went multi-tenant.
 
 ---
 
@@ -472,6 +501,9 @@ Pick 3–4 of these depending on time. Each one demonstrates a different capabil
 - Time windows: 30d / 90d / 365d (CAGR on 365d only)
 - Enumeration cardinality: 2–500
 - Row chunk cap: 500/table
+- Capacity card thresholds: amber ≥75% RAM used, red ≥90% (warn-only, never blocks)
+- Row count persistence: `file_stats` table in `metadata.sqlite`, written at ingest, cascade-deleted on file delete
+- Tests: 208 (203 original + 5 file_stats)
 
 ---
 

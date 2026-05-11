@@ -82,7 +82,7 @@ The API key lives only in your browser's `localStorage` (keys: `fundlenz_llm_pro
 ```
 backend/
   app/
-    main.py            FastAPI app: /ingest, /chat (SSE), /documents, /health
+    main.py            FastAPI app: /ingest, /chat (SSE), /documents, /health, /stats, /settings, /llm/local
     ingest.py          parse → chunk → embed → index orchestrator
     config.py          pydantic-settings (.env-driven)
     state.py           CompositeIndex + dataframes + chat history
@@ -96,11 +96,11 @@ backend/
     analysis/          metrics, query, charts, column_match
   data/                indexes/, uploads/  (gitignored)
   scripts/migrate_v2.py
-  tests/               203 tests
+  tests/               208 tests
 frontend/
   src/
     App.tsx
-    components/        ChatWindow, MessageBubble, FileUpload, DocumentList, PlotlyChart
+    components/        ChatWindow, MessageBubble, FileUpload, DocumentList, StatsCard, PlotlyChart
     api/client.ts      fetch + SSE parser
 ```
 
@@ -130,6 +130,7 @@ See [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md) for the full layout, data flow, and
 - **Migration.** When `SCHEMA_VERSION` bumps or the index gets corrupted, stop the backend and run `python -m backend.scripts.migrate_v2`. It wipes `data/indexes/*` and re-ingests everything from `data/uploads/`.
 - **Tool calling** requires an Ollama model that supports it. Qwen 2.5, Mistral, and recent Llama 3.x all do. Anthropic and OpenAI both support tool calling out of the box — the same `compute_metric` and `query_table` schemas are converted to each provider's format inside `app/llm/anthropic_client.py` / `app/llm/openai_client.py`.
 - **Cloud LLM credentials** never leave your browser → backend request path. The API key is held in `localStorage`, sent in the JSON body of `/chat`, and used for the duration of that request only. Nothing is logged, cached, or written to disk on the backend.
+- **Sidebar capacity indicator.** After each upload, the sidebar **Capacity** card refreshes from `GET /stats` and shows total tabular rows (persisted to SQLite, so the count survives a backend restart) plus system RAM available / total / process RSS. The RAM row turns amber at ≥75% system RAM used and red at ≥90% — warn-only, ingestion is never blocked.
 - Out of scope for the scaffold: auth, multi-user, cloud deployment.
 
 ## Testing
@@ -139,4 +140,4 @@ cd backend
 pytest -q
 ```
 
-203 tests, ~90s cold (faiss + sentence-transformers + cross-encoder stub all import). See the Testing section in [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md#testing) for the per-file breakdown.
+208 tests, ~90s cold (faiss + sentence-transformers + cross-encoder stub all import). See the Testing section in [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md#testing) for the per-file breakdown.
