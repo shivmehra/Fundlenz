@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 
 from app import state
+from app.chunkers.common import now_iso
 from app.chunkers.entity_chunker import build_entity_chunks
 from app.chunkers.numeric_encoder import build_numeric_vectors
 from app.chunkers.tabular_chunker import build_tabular_chunks
@@ -113,6 +114,11 @@ def ingest_file(path: Path, original_filename: str) -> dict:
                 "type": suffix.lstrip("."),
                 "chunks": len(sheet_items),
             }
+            # Persist the row count so the sidebar stats card survives a
+            # backend restart even though state.dataframes_by_file_id doesn't.
+            state.composite.meta.upsert_file_stat(
+                sheet_file_id, logical_name, int(len(df)), now_iso()
+            )
             summary_parts.append(_synopsis_one_line(df, logical_name))
 
     else:

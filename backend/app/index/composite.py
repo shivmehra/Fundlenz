@@ -161,6 +161,10 @@ class CompositeIndex:
     # ---------- mutation ----------
 
     def delete_by_file(self, file: str) -> int:
+        # Drop the per-file row stat first so the sidebar count stays accurate
+        # even if the chunk delete short-circuits below (e.g. a file with zero
+        # chunks but a stat row from a prior partial ingest).
+        self.meta.delete_file_stats_by_filename(file)
         deleted_chunk_ids = self.meta.delete_by_file(file)
         if not deleted_chunk_ids:
             return 0

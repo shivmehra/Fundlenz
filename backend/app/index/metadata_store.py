@@ -47,6 +47,23 @@ class MetaStore:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_type ON chunks(chunk_type)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id)")
+
+        # Per-file row counts for the sidebar stats card. Persisted here (not in
+        # state.dataframes_by_file_id) so the count survives a backend restart
+        # even though the DataFrames don't.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS file_stats (
+                file_id        TEXT PRIMARY KEY,
+                filename       TEXT NOT NULL,
+                row_count      INTEGER NOT NULL,
+                ingestion_time TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_file_stats_filename ON file_stats(filename)"
+        )
         self.conn.commit()
 
     def upsert_many(self, metas: list[ChunkMeta]) -> None:
@@ -148,6 +165,53 @@ class MetaStore:
         cur.execute("DELETE FROM chunks WHERE file = ?", (file,))
         self.conn.commit()
         return chunk_ids
+
+    # ---------- file_stats ----------
+
+    def upsert_file_stat(
+        self,
+        file_id: str,
+        filename: str,
+        row_count: int,
+        ingestion_time: str,
+    ) -> None:
+        assert self.conn is not None
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO file_stats
+              (file_id, filename, row_count, ingestion_time)
+            VALUES (?, ?, ?, ?)
+            """,
+            (file_id, filename, row_count, ingestion_time),
+        )
+        self.conn.commit()
+
+    def total_rows(self) -> int:
+        assert self.conn is not None
+        return self.conn.execute(
+            "SELECT COALESCE(SUM(row_count), 0) FROM file_stats"
+        ).fetchone()[0]
+
+    def delete_file_stats_by_filename(self, filename: str) -> None:
+        assert self.conn is not None
+        self.conn.execute("DELETE FROM file_stats WHERE filename = ?", (filename,))
+        self.conn.commit()
+
+    def list_file_stats(self) -> list[dict]:
+        assert self.conn is not None
+        rows = self.conn.execute(
+            "SELECT file_id, filename, row_count, ingestion_time "
+            "FROM file_stats ORDER BY filename"
+        ).fetchall()
+        return [
+            {
+                "file_id": r[0],
+                "filename": r[1],
+                "row_count": r[2],
+                "ingestion_time": r[3],
+            }
+            for r in rows
+        ]
 
     def close(self) -> None:
         if self.conn is not None:

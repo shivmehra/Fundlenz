@@ -80,6 +80,24 @@ export async function getLocalLLMInfo(): Promise<LocalLLMInfo> {
   return res.json();
 }
 
+export interface StatsResponse {
+  ram: {
+    process_rss_bytes: number;
+    system_available_bytes: number;
+    system_total_bytes: number;
+    system_percent_used: number;
+  };
+  rows: {
+    total_tabular_rows: number;
+  };
+}
+
+export async function getStats(): Promise<StatsResponse> {
+  const res = await fetch("/api/stats");
+  if (!res.ok) throw new Error("Failed to fetch stats");
+  return res.json();
+}
+
 export async function uploadFile(file: File): Promise<IngestResult> {
   const fd = new FormData();
   fd.append("file", file);

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import ChatWindow from "./components/ChatWindow";
 import DocumentList from "./components/DocumentList";
+import StatsCard from "./components/StatsCard";
 import {
   getSettings,
   updateSettings,
@@ -147,6 +148,8 @@ export default function App() {
       <aside className={`sidebar ${drawerOpen ? "open" : ""}`}>
         <p className="sidebar-title">Indexed documents</p>
         <DocumentList refreshTrigger={refreshTick} />
+
+        <StatsCard refreshTrigger={refreshTick} />
 
         <div className="settings-section">
           <p className="settings-title">Settings</p>

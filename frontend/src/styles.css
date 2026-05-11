@@ -578,6 +578,56 @@ label.upload input { display: none; }
 
 .sidebar-backdrop { display: none; }
 
+/* ── Stats card (Total rows + RAM capacity) ── */
+
+.stats-card {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.stats-card .settings-title {
+  margin: 0 0 4px;
+}
+
+.stats-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text);
+  padding: 2px 0;
+}
+
+.stats-label {
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+.stats-value {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.stats-row-muted .stats-value,
+.stats-row-muted .stats-label {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+/* Warn-only thresholds — never block ingestion, only signal pressure. */
+.stats-row.stats-warn .stats-value {
+  color: #d29922; /* amber */
+}
+
+.stats-row.stats-critical .stats-value {
+  color: #f85149; /* red */
+}
+
 /* ── LLM provider section ── */
 
 /* First .settings-section has margin-top: auto to stick to the sidebar's

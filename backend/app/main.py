@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 import pandas as pd
+import psutil
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -121,6 +122,26 @@ def patch_settings(body: SettingsPatch) -> dict:
     if body.enable_cross_encoder is not None:
         settings.enable_cross_encoder = body.enable_cross_encoder
     return _settings_snapshot()
+
+
+@app.get("/stats")
+def get_stats() -> dict:
+    """Sidebar capacity indicator: total tabular rows persisted to SQLite +
+    current RAM stats (system available is the meaningful ceiling on what
+    can still be ingested without swapping). Cheap to compute (~1ms)."""
+    vm = psutil.virtual_memory()
+    proc_rss = psutil.Process().memory_info().rss
+    return {
+        "ram": {
+            "process_rss_bytes": proc_rss,
+            "system_available_bytes": vm.available,
+            "system_total_bytes": vm.total,
+            "system_percent_used": vm.percent,
+        },
+        "rows": {
+            "total_tabular_rows": state.composite.meta.total_rows(),
+        },
+    }
 
 
 @app.get("/llm/local")

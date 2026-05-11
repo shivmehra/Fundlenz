@@ -21,3 +21,7 @@ ollama>=0.3.3
 anthropic>=0.39.0
 openai>=1.54.0
 tiktoken>=0.8.0
+
+# Process + system RAM stats for the /stats endpoint that powers the sidebar
+# capacity indicator. Ships wheels for Python 3.11–3.13 on Win/macOS/Linux.
+psutil>=5.9

@@ -101,3 +101,38 @@ def test_list_files(store):
         _meta("c3", file="b.xlsx"),
     ])
     assert store.list_files() == ["a.xlsx", "b.xlsx"]
+
+
+# ---------- file_stats ----------
+
+def test_total_rows_empty(store):
+    assert store.total_rows() == 0
+
+
+def test_upsert_file_stat_and_total(store):
+    store.upsert_file_stat("fid1", "a.xlsx", 100, "2026-05-11T00:00:00Z")
+    store.upsert_file_stat("fid2", "b.xlsx", 250, "2026-05-11T00:00:00Z")
+    assert store.total_rows() == 350
+
+
+def test_upsert_file_stat_replaces_existing(store):
+    store.upsert_file_stat("fid1", "a.xlsx", 100, "2026-05-11T00:00:00Z")
+    store.upsert_file_stat("fid1", "a.xlsx", 500, "2026-05-12T00:00:00Z")
+    assert store.total_rows() == 500
+
+
+def test_delete_file_stats_by_filename(store):
+    store.upsert_file_stat("fid1", "a.xlsx", 100, "2026-05-11T00:00:00Z")
+    store.upsert_file_stat("fid2", "b.xlsx", 250, "2026-05-11T00:00:00Z")
+    store.delete_file_stats_by_filename("a.xlsx")
+    assert store.total_rows() == 250
+    listing = store.list_file_stats()
+    assert len(listing) == 1
+    assert listing[0]["filename"] == "b.xlsx"
+
+
+def test_file_stats_multisheet_excel_summed(store):
+    # Each sheet ingests with its own file_id; total_rows sums them.
+    store.upsert_file_stat("fid_sheet1", "fund.xlsx :: Sheet1", 100, "2026-05-11T00:00:00Z")
+    store.upsert_file_stat("fid_sheet2", "fund.xlsx :: Sheet2", 200, "2026-05-11T00:00:00Z")
+    assert store.total_rows() == 300
