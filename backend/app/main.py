@@ -17,7 +17,8 @@ from app.analysis.metrics import compute
 from app.analysis.query import query_table
 from app.config import settings
 from app.ingest import ingest_file
-from app.llm.ollama_client import build_messages, rewrite_query, stream_chat
+from app.llm.ollama_client import build_messages, rewrite_query
+from app.llm.router import stream_chat
 from app.llm.tools import TOOL_COMPUTE_METRIC, TOOL_QUERY_TABLE, TOOLS
 from app.parsers.pdf import extract_pdf_tables_as_csv
 from app.retrieval.orchestrator import format_context_v2, retrieve_v2
@@ -122,6 +123,13 @@ def patch_settings(body: SettingsPatch) -> dict:
     return _settings_snapshot()
 
 
+@app.get("/llm/local")
+def get_llm_local() -> dict:
+    """The local LLM the backend falls back to when no API key is provided.
+    The frontend uses this to render the LLM badge when no cloud config is set."""
+    return {"provider": "ollama", "model": settings.ollama_model}
+
+
 @app.get("/health")
 def health() -> dict:
     stats = state.composite.stats()
@@ -224,10 +232,17 @@ async def ingest(file: UploadFile = File(...)) -> dict:
     return result
 
 
+class LLMConfig(BaseModel):
+    provider: str  # "anthropic" | "openai"
+    api_key: str
+    model: str | None = None
+
+
 class ChatRequest(BaseModel):
     session_id: str
     message: str
     mode: str = "auto"  # "auto" | "chat" | "aggregate" | "query"
+    llm: LLMConfig | None = None
 
 
 @app.post("/chat")
@@ -311,8 +326,9 @@ async def chat(req: ChatRequest):
 
         tools = _select_tools(req.message, req.mode)
 
+        llm_cfg = req.llm.model_dump() if req.llm else None
         try:
-            async for item in stream_chat(messages, tools=tools):
+            async for item in stream_chat(messages, tools=tools, llm_config=llm_cfg):
                 if item["type"] == "token":
                     full_answer += item["content"]
                     yield {"event": "token", "data": item["content"]}

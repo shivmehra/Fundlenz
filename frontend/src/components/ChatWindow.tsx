@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { streamChat, type ChatMode, type IngestResult } from "../api/client";
+import { streamChat, getLLMConfig, type ChatMode, type IngestResult } from "../api/client";
 import type { Message } from "../types";
 import MessageBubble from "./MessageBubble";
 import FileUpload from "./FileUpload";
@@ -64,6 +64,7 @@ export default function ChatWindow({ sessionId, onUploaded }: Props) {
       },
       controller.signal,
       mode,
+      getLLMConfig(),
     );
     abortRef.current = null;
   }

@@ -1,7 +1,18 @@
 import { useEffect, useMemo, useState } from "react";
 import ChatWindow from "./components/ChatWindow";
 import DocumentList from "./components/DocumentList";
-import { getSettings, updateSettings } from "./api/client";
+import {
+  getSettings,
+  updateSettings,
+  getLLMConfig,
+  setLLMConfig,
+  getLocalLLMInfo,
+  PROVIDER_DEFAULT_MODELS,
+  type LLMProvider,
+  type LocalLLMInfo,
+} from "./api/client";
+
+type ProviderChoice = "local" | LLMProvider;
 
 export default function App() {
   const sessionId = useMemo(() => crypto.randomUUID(), []);
@@ -11,6 +22,15 @@ export default function App() {
   const [crossEncoder, setCrossEncoder] = useState(true);
   const [openTooltip, setOpenTooltip] = useState<string | null>(null);
 
+  // Cloud-LLM config. The "active" provider drives the header badge and the
+  // actual request routing — it only changes when the user clicks Save.
+  // The dropdown/input are form state and may be ahead of what's saved.
+  const [providerChoice, setProviderChoice] = useState<ProviderChoice>("local");
+  const [apiKeyInput, setApiKeyInput] = useState("");
+  const [activeProvider, setActiveProvider] = useState<ProviderChoice>("local");
+  const [localLLM, setLocalLLM] = useState<LocalLLMInfo | null>(null);
+  const [keySaveNotice, setKeySaveNotice] = useState<string | null>(null);
+
   useEffect(() => {
     getSettings()
       .then((s) => {
@@ -18,6 +38,18 @@ export default function App() {
         setCrossEncoder(s.enable_cross_encoder);
       })
       .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    getLocalLLMInfo()
+      .then(setLocalLLM)
+      .catch(() => {});
+    const saved = getLLMConfig();
+    if (saved) {
+      setProviderChoice(saved.provider);
+      setApiKeyInput(saved.api_key);
+      setActiveProvider(saved.provider);
+    }
   }, []);
 
   // Close drawer on Escape.
@@ -68,6 +100,35 @@ export default function App() {
     } catch {}
   }
 
+  function handleSaveLLM() {
+    if (providerChoice === "local") {
+      setLLMConfig(null);
+      setApiKeyInput("");
+      setActiveProvider("local");
+      setKeySaveNotice("Using local LLM");
+    } else {
+      const trimmed = apiKeyInput.trim();
+      if (!trimmed) {
+        setKeySaveNotice("API key cannot be empty");
+        return;
+      }
+      setLLMConfig({ provider: providerChoice, api_key: trimmed });
+      setActiveProvider(providerChoice);
+      setKeySaveNotice("Saved");
+    }
+    setTimeout(() => setKeySaveNotice(null), 2000);
+  }
+
+  function llmBadgeLabel(): string {
+    if (activeProvider !== "local") {
+      const providerLabel = activeProvider === "anthropic" ? "Anthropic" : "OpenAI";
+      const model = PROVIDER_DEFAULT_MODELS[activeProvider];
+      return `${providerLabel}: ${model}`;
+    }
+    if (localLLM) return `Local: ${localLLM.model}`;
+    return "Local";
+  }
+
   return (
     <div className="app">
       <div className="header">
@@ -79,6 +140,7 @@ export default function App() {
           ☰
         </button>
         <h1>Fundlenz</h1>
+        <span className="llm-badge" title="Active LLM">{llmBadgeLabel()}</span>
         <span className="meta">session {sessionId.slice(0, 6)}</span>
       </div>
 
@@ -160,6 +222,63 @@ export default function App() {
                 Resets on backend restart.
               </div>
             )}
+          </div>
+        </div>
+
+        <div className="settings-section llm-section">
+          <div className="llm-title-row">
+            <p className="settings-title">LLM provider</p>
+            <span
+              className={`tooltip-anchor ${openTooltip === "llm" ? "open" : ""}`}
+              role="button"
+              tabIndex={0}
+              aria-label="Help: LLM provider"
+              onClick={(e) => toggleTooltip("llm", e)}
+            >
+              ℹ
+            </span>
+            {openTooltip === "llm" && (
+              <div className="tooltip-text" onClick={(e) => e.stopPropagation()}>
+                <button
+                  type="button"
+                  className="tooltip-close"
+                  aria-label="Close"
+                  onClick={() => setOpenTooltip(null)}
+                >
+                  ×
+                </button>
+                Choose between the local LLM (Ollama) and a cloud LLM. API key
+                is stored only in your browser's localStorage — never sent to
+                disk on the backend. Leave on "Local" to use the default
+                without a key.
+              </div>
+            )}
+          </div>
+          <select
+            className="llm-provider-select"
+            value={providerChoice}
+            onChange={(e) => setProviderChoice(e.target.value as ProviderChoice)}
+          >
+            <option value="local">Local (Ollama)</option>
+            <option value="anthropic">Anthropic (Claude)</option>
+            <option value="openai">OpenAI (GPT)</option>
+          </select>
+          {providerChoice !== "local" && (
+            <input
+              type="password"
+              className="llm-key-input"
+              placeholder={`${providerChoice === "anthropic" ? "Anthropic" : "OpenAI"} API key`}
+              value={apiKeyInput}
+              onChange={(e) => setApiKeyInput(e.target.value)}
+              autoComplete="off"
+              spellCheck={false}
+            />
+          )}
+          <div className="llm-save-row">
+            <button type="button" className="llm-save-btn" onClick={handleSaveLLM}>
+              Save
+            </button>
+            {keySaveNotice && <span className="llm-save-notice">{keySaveNotice}</span>}
           </div>
         </div>
       </aside>

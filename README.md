@@ -1,6 +1,6 @@
 # Fundlenz
 
-A local RAG chatbot for fund document analysis. Upload fund factsheets (PDF), holdings/NAV spreadsheets (CSV/XLSX), or reports (DOCX) and ask questions; the chatbot retrieves from a multi-index pipeline (inverted exact-match + text ANN + numeric range), streams an answer from a local Ollama-served LLM, and can run pandas-driven aggregations or filters with Plotly charts inline.
+A local RAG chatbot for fund document analysis. Upload fund factsheets (PDF), holdings/NAV spreadsheets (CSV/XLSX), or reports (DOCX) and ask questions; the chatbot retrieves from a multi-index pipeline (inverted exact-match + text ANN + numeric range), streams an answer from an LLM (local Ollama by default, or Anthropic / OpenAI when you supply an API key), and can run pandas-driven aggregations or filters with Plotly charts inline.
 
 For full architectural details, module-by-module references, pitfalls, migration, and testing, see [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md).
 
@@ -10,7 +10,7 @@ For full architectural details, module-by-module references, pitfalls, migration
 - **Indexing:** `CompositeIndex` — FAISS `IndexFlatIP` for text ANN, JSON inverted index for `id:`/`cell:`/`enum:` exact matches, SQLite for chunk metadata, optional per-file numeric FAISS (gated)
 - **Embeddings:** SentenceTransformers `multi-qa-MiniLM-L6-cos-v1` (asymmetric, query/passage trained, 384-dim)
 - **Reranker (optional, on by default):** `cross-encoder/ms-marco-MiniLM-L-6-v2`
-- **LLM:** Ollama (default `qwen2.5:7b`, configurable via env)
+- **LLM:** Ollama (default `qwen2.5:7b`, configurable via env). Optional cloud routing to Anthropic (`claude-sonnet-4-6`) or OpenAI (`gpt-4o`) — provider + API key are entered in the UI, stored only in browser `localStorage`, and sent per-request. No key → falls back to local Ollama.
 - **Parsing:** pdfplumber, python-docx, pandas (+ openpyxl)
 - **Frontend:** React + TypeScript + Vite, react-plotly.js for charts
 
@@ -64,6 +64,19 @@ On Windows you can launch both with `start.bat` from the repo root.
 
 Numeric-threshold queries ("funds with AUM > 5000") bypass the LLM entirely and run a deterministic pandas filter — that's why their confidence reads `deterministic`.
 
+### Choosing the LLM
+
+The badge next to the title in the header always shows the active LLM (e.g. `Local: qwen2.5:7b` or `Anthropic: claude-sonnet-4-6`). To switch:
+
+1. Open the sidebar **LLM provider** section.
+2. Pick **Anthropic (Claude)** or **OpenAI (GPT)** from the dropdown.
+3. Paste your API key into the password field.
+4. Click **Save**. The badge updates and subsequent chats route to the cloud provider.
+
+To go back to local, set the dropdown to **Local (Ollama)** and click Save (the saved key is cleared from `localStorage`).
+
+The API key lives only in your browser's `localStorage` (keys: `fundlenz_llm_provider`, `fundlenz_llm_api_key`). It is sent in the `/chat` request body but is never written to disk by the backend. Cloud failures (bad key, rate limit, network) surface as an error message in the chat — there is no silent fallback to local.
+
 ## Layout (high level)
 
 ```
@@ -79,7 +92,7 @@ backend/
     index/             text_ann, numeric_ann, inverted, metadata_store, composite
     rag/               schema, embedder, numeric_scaler
     retrieval/         router, exact, semantic, rerank, cross_encoder, orchestrator
-    llm/               ollama_client, tools
+    llm/               ollama_client, anthropic_client, openai_client, router, tools
     analysis/          metrics, query, charts, column_match
   data/                indexes/, uploads/  (gitignored)
   scripts/migrate_v2.py
@@ -115,7 +128,8 @@ See [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md) for the full layout, data flow, and
 - **PDF table extraction.** When you upload a PDF, every detected table is also written as a CSV to `backend/data/uploads/{pdf_stem}_page{N}_table{M}.csv` and ingested through the tabular pipeline. The upload status tells you how many landed and how many failed.
 - **Re-uploading appends.** `ingest_file` always assigns a new `file_id`. Use the delete button before re-uploading the same file, or run `python -m backend.scripts.migrate_v2` to wipe-and-rebuild from `data/uploads/`.
 - **Migration.** When `SCHEMA_VERSION` bumps or the index gets corrupted, stop the backend and run `python -m backend.scripts.migrate_v2`. It wipes `data/indexes/*` and re-ingests everything from `data/uploads/`.
-- **Tool calling** requires an Ollama model that supports it. Qwen 2.5, Mistral, and recent Llama 3.x all do.
+- **Tool calling** requires an Ollama model that supports it. Qwen 2.5, Mistral, and recent Llama 3.x all do. Anthropic and OpenAI both support tool calling out of the box — the same `compute_metric` and `query_table` schemas are converted to each provider's format inside `app/llm/anthropic_client.py` / `app/llm/openai_client.py`.
+- **Cloud LLM credentials** never leave your browser → backend request path. The API key is held in `localStorage`, sent in the JSON body of `/chat`, and used for the duration of that request only. Nothing is logged, cached, or written to disk on the backend.
 - Out of scope for the scaffold: auth, multi-user, cloud deployment.
 
 ## Testing

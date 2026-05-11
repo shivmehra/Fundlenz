@@ -578,6 +578,101 @@ label.upload input { display: none; }
 
 .sidebar-backdrop { display: none; }
 
+/* ── LLM provider section ── */
+
+/* First .settings-section has margin-top: auto to stick to the sidebar's
+   bottom. The second one (LLM) should stack right above it with a normal gap,
+   not split the remaining space — so override the auto margin. */
+.llm-section {
+  margin-top: 12px;
+}
+
+.llm-title-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.llm-title-row .settings-title {
+  margin: 0;
+  flex: 1;
+}
+
+.llm-provider-select {
+  width: 100%;
+  background: #0d1117;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.llm-key-input {
+  width: 100%;
+  box-sizing: border-box;
+  background: #0d1117;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 12px;
+  margin-bottom: 6px;
+  font-family: inherit;
+}
+
+.llm-key-input:focus,
+.llm-provider-select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.llm-save-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.llm-save-btn {
+  background: rgba(88, 166, 255, 0.15);
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 4px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.llm-save-btn:hover {
+  background: rgba(88, 166, 255, 0.25);
+}
+
+.llm-save-notice {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* ── Header LLM badge ── */
+
+.llm-badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: 11px;
+  color: var(--muted);
+  background: rgba(139, 148, 158, 0.12);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 2px 8px;
+  white-space: nowrap;
+}
+
+@media (max-width: 768px) {
+  .llm-badge { font-size: 10px; padding: 1px 6px; }
+}
+
 /* ── Mobile (≤ 768px): sidebar collapses to slide-in drawer ── */
 
 @media (max-width: 768px) {

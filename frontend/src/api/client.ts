@@ -29,6 +29,57 @@ export interface IngestResult {
 
 export type ChatMode = "auto" | "chat" | "aggregate" | "query";
 
+export type LLMProvider = "anthropic" | "openai";
+
+export interface LLMConfig {
+  provider: LLMProvider;
+  api_key: string;
+  model?: string;
+}
+
+export interface LocalLLMInfo {
+  provider: string;
+  model: string;
+}
+
+const LLM_PROVIDER_KEY = "fundlenz_llm_provider";
+const LLM_API_KEY_KEY = "fundlenz_llm_api_key";
+
+export function getLLMConfig(): LLMConfig | null {
+  try {
+    const provider = localStorage.getItem(LLM_PROVIDER_KEY);
+    const api_key = localStorage.getItem(LLM_API_KEY_KEY);
+    if (!provider || !api_key) return null;
+    if (provider !== "anthropic" && provider !== "openai") return null;
+    return { provider: provider as LLMProvider, api_key };
+  } catch {
+    return null;
+  }
+}
+
+export function setLLMConfig(cfg: LLMConfig | null): void {
+  try {
+    if (!cfg) {
+      localStorage.removeItem(LLM_PROVIDER_KEY);
+      localStorage.removeItem(LLM_API_KEY_KEY);
+      return;
+    }
+    localStorage.setItem(LLM_PROVIDER_KEY, cfg.provider);
+    localStorage.setItem(LLM_API_KEY_KEY, cfg.api_key);
+  } catch {}
+}
+
+export const PROVIDER_DEFAULT_MODELS: Record<LLMProvider, string> = {
+  anthropic: "claude-sonnet-4-6",
+  openai: "gpt-4o",
+};
+
+export async function getLocalLLMInfo(): Promise<LocalLLMInfo> {
+  const res = await fetch("/api/llm/local");
+  if (!res.ok) throw new Error("Failed to fetch local LLM info");
+  return res.json();
+}
+
 export async function uploadFile(file: File): Promise<IngestResult> {
   const fd = new FormData();
   fd.append("file", file);
@@ -75,12 +126,15 @@ export async function streamChat(
   h: StreamHandlers,
   signal?: AbortSignal,
   mode: ChatMode = "auto",
+  llmConfig?: LLMConfig | null,
 ): Promise<void> {
   try {
+    const body: Record<string, unknown> = { session_id: sessionId, message, mode };
+    if (llmConfig) body.llm = llmConfig;
     const res = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-      body: JSON.stringify({ session_id: sessionId, message, mode }),
+      body: JSON.stringify(body),
       signal,
     });
     if (!res.body) throw new Error("No stream body");

@@ -1,6 +1,6 @@
 # Fundlenz — Developer Guide
 
-A local RAG chatbot that ingests fund documents (PDFs, Word, CSV, Excel) and answers questions using a multi-index retrieval pipeline (inverted exact-match + text ANN + numeric range), deterministic ranking, optional pandas-driven analysis, and Plotly charts. Everything runs locally — no cloud services required.
+A local RAG chatbot that ingests fund documents (PDFs, Word, CSV, Excel) and answers questions using a multi-index retrieval pipeline (inverted exact-match + text ANN + numeric range), deterministic ranking, optional pandas-driven analysis, and Plotly charts. Indexing, retrieval, and embeddings run locally; generation defaults to a local Ollama LLM but can be routed to Anthropic or OpenAI by entering an API key in the UI (the key lives in `localStorage`, never on the backend).
 
 ---
 
@@ -100,8 +100,9 @@ Opens two cmd windows: backend on port 8000, frontend on port 5173. Open `http:/
                 |    scaler_<fid>.json          |                  |
                 |    aliases.json               |                  v
                 +-------------------------------+     +-------------------------+
-                                                      | LLM synthesis (Ollama)  |
-                                                      |   provenance + cites    |
+                                                      | LLM synthesis           |
+                                                      |   llm/router → ollama   |
+                                                      |   /anthropic/openai     |
                                                       +-------------------------+
 ```
 
@@ -116,7 +117,7 @@ Opens two cmd windows: backend on port 8000, frontend on port 5173. Open `http:/
 | Inverted index | JSON file (`inverted.json`) — three keyspaces (`id:`, `cell:`, `enum:`) |
 | Metadata store | SQLite (`metadata.sqlite`) |
 | Cross-encoder | `cross-encoder/ms-marco-MiniLM-L-6-v2` (optional 2nd-stage rerank) |
-| LLM | Qwen 2.5 7B via Ollama (configurable via `OLLAMA_MODEL`) |
+| LLM | Local: Qwen 2.5 7B via Ollama (configurable via `OLLAMA_MODEL`). Cloud (opt-in, key in browser localStorage): Anthropic `claude-sonnet-4-6` or OpenAI `gpt-4o`. Routed by `app/llm/router.py`. |
 | PDF parsing | pdfplumber (preserves tables; tables also extracted to CSV) |
 | Tabular | pandas |
 | Streaming | Server-Sent Events (SSE) |
@@ -187,7 +188,10 @@ Fundlenz/
 │       │   ├── cross_encoder.py     # Stage-2 CE reranker (lazy-loaded)
 │       │   └── orchestrator.py      # retrieve_v2 + format_context_v2
 │       ├── llm/
-│       │   ├── ollama_client.py     # build_messages, rewrite_query, stream_chat
+│       │   ├── ollama_client.py     # build_messages, rewrite_query, stream_chat (local)
+│       │   ├── anthropic_client.py  # Anthropic SDK stream_chat (cloud)
+│       │   ├── openai_client.py     # OpenAI SDK stream_chat (cloud)
+│       │   ├── router.py            # Picks provider from request llm_config
 │       │   └── tools.py             # compute_metric + query_table schemas
 │       └── analysis/
 │           ├── metrics.py           # compute() — top/mean/sum/count/min/max/trend
@@ -202,9 +206,10 @@ Fundlenz/
         ├── styles.css          # CSS variables, grid layout, table rendering rules
         ├── types.ts            # Source / ChartPayload / Message / Confidence
         ├── api/
-        │   └── client.ts       # uploadFile, getDocuments, deleteDocument, streamChat
+        │   └── client.ts       # uploadFile, getDocuments, deleteDocument, streamChat,
+        │                       #   getLLMConfig/setLLMConfig (localStorage), getLocalLLMInfo
         └── components/
-            ├── ChatWindow.tsx     # Message list + composer + mode pills
+            ├── ChatWindow.tsx     # Message list + composer + mode pills (reads llmConfig)
             ├── MessageBubble.tsx  # Single message (text + sources + chart + confidence)
             ├── DocumentList.tsx   # Sidebar: indexed files + delete
             ├── FileUpload.tsx     # Sidebar: file picker + status (incl. PDF table extracts)
@@ -305,7 +310,8 @@ Per-CSV failures are caught individually so one bad table can't suppress the res
 ### 2. Chat Request (`POST /chat`)
 
 ```
-{session_id, message, mode: "auto" | "chat" | "aggregate" | "query"}
+{session_id, message, mode: "auto" | "chat" | "aggregate" | "query",
+ llm?: { provider: "anthropic" | "openai", api_key, model? }}   ← optional
     │
     ▼
 ollama_client.py::rewrite_query(message, history)
@@ -353,7 +359,9 @@ main.py::_select_tools(message, mode)
     └─ "auto"       → keyword-gated (TOOLS or None)
     │
     ▼
-stream_chat(messages, tools=...)
+llm/router.py::stream_chat(messages, tools=..., llm_config=req.llm)
+    ├─ valid (provider, api_key) → anthropic_client / openai_client
+    └─ otherwise                  → ollama_client (local fallback)
     │
     ├─ token chunks  ──► "event: token" (streamed live)
     └─ tool_call ───────► _run_compute_metric / _run_query_table
@@ -584,12 +592,15 @@ The most heavily-engineered parser, because tabular data is where the system bot
 
 ### `app/llm/`
 
-- **`ollama_client.py`** — Ollama async client. `build_messages`, `rewrite_query` (folds chat history into the search query), `stream_chat` (SSE-friendly).
-- **`tools.py`** — `compute_metric` and `query_table` tool schemas + `SYSTEM_PROMPT`.
+- **`ollama_client.py`** — Local async client. `build_messages`, `rewrite_query` (folds chat history into the search query), `stream_chat`.
+- **`anthropic_client.py`** — Anthropic SDK client. Same `stream_chat` event contract as ollama (`{type: "token" | "tool_call"}`). Splits the system message out into Anthropic's separate `system` param and converts OpenAI-style tool schemas (`{type: function, function: {...}}`) into Anthropic's flat `{name, description, input_schema}` shape. Default model `claude-sonnet-4-6`. Tool calls are read from the final assembled message after streaming.
+- **`openai_client.py`** — OpenAI SDK client. Same `stream_chat` contract. Tool-call arguments arrive as a JSON string split across delta chunks; the client buffers per-`tc.index` and parses once on `finish_reason == "tool_calls"`. Default model `gpt-4o`.
+- **`router.py`** — `stream_chat(messages, tools, llm_config)` picks the right client. Valid `(provider, api_key)` → anthropic / openai; otherwise → ollama. No silent fallback on cloud failure — exceptions propagate to `/chat`'s try/except so the user sees `Model error: ...`.
+- **`tools.py`** — `compute_metric` and `query_table` tool schemas + `SYSTEM_PROMPT`. The schemas are kept in OpenAI's "function" format because both Ollama and OpenAI accept it natively; `anthropic_client._convert_tools` translates to Anthropic's format on the fly.
 
-`rewrite_query` runs *before* retrieval; the rewritten query is used only to embed and search. The original message still flows into `build_messages` for generation. Skipped when history is empty; falls back to the original message on any error. Adds ~0.5–1.5s latency per chat turn on Qwen 7B.
+`rewrite_query` runs *before* retrieval; the rewritten query is used only to embed and search. The original message still flows into `build_messages` for generation. Skipped when history is empty; falls back to the original message on any error. Adds ~0.5–1.5s latency per chat turn on Qwen 7B. **Note:** `rewrite_query` always uses local Ollama even when chat generation is routed to a cloud provider — keeping it local avoids spending cloud tokens on every retrieval step.
 
-`stream_chat(messages, tools=None)` is a single streaming call. When `tools=None`, no tools are sent to Ollama. When `tools=[...]`, the model may emit a tool call in the final chunk; text tokens stream live before that.
+`stream_chat(messages, tools=None, llm_config=None)` (the router-level entry) yields a uniform event stream regardless of provider: `{"type": "token", "content": str}` for streamed text and `{"type": "tool_call", "name": str, "arguments": dict}` for tool calls. The chat handler consumes the same shape for all three backends.
 
 **Tool selection is gated server-side** (`main.py::_select_tools`). Local 7B-class models tend to call any registered tool with hallucinated arguments; Qwen 2.5 is markedly better but the gate stays in place. Combines:
 
@@ -623,7 +634,10 @@ All network calls. The Vite dev server proxies `/api/*` to `http://127.0.0.1:800
 - `uploadFile(file)` — multipart POST to `/api/ingest`. Returns `IngestResult { filename, chunks, summary, extracted_tables? }`.
 - `getDocuments()` — GET `/api/documents`.
 - `deleteDocument(filename)` — DELETE `/api/documents/{encoded filename}`.
-- `streamChat(sessionId, message, handlers, signal?, mode?)` — POST `/api/chat`, reads response body as a stream. Parses SSE manually (not `EventSource`) because `EventSource` doesn't support POST.
+- `streamChat(sessionId, message, handlers, signal?, mode?, llmConfig?)` — POST `/api/chat`, reads response body as a stream. Parses SSE manually (not `EventSource`) because `EventSource` doesn't support POST. When `llmConfig` is supplied, it is included in the request body as `llm: { provider, api_key, model? }`.
+- `getLLMConfig()` / `setLLMConfig(cfg | null)` — `localStorage`-backed accessors for the cloud LLM credentials (keys: `fundlenz_llm_provider`, `fundlenz_llm_api_key`). Returns `null` when nothing is saved or the saved provider is unknown.
+- `getLocalLLMInfo()` — GET `/api/llm/local`. Returns `{provider: "ollama", model: <ollama_model>}`. Used by the header badge to show the local default when no cloud key is set.
+- `PROVIDER_DEFAULT_MODELS` — `{anthropic: "claude-sonnet-4-6", openai: "gpt-4o"}`. Source of truth for the badge label.
 
 **SSE parsing details (subtle):**
 - Frame separator is `\r?\n\r?\n` (regex). `sse-starlette` emits HTTP-style CRLF (`\r\n\r\n`); a naive split on `\n\n` will silently never match.
@@ -642,9 +656,11 @@ Message      // {role, content, sources?, chart?, confidence?}
 
 Root layout. Two-column CSS grid: 220px sidebar + flexible chat area on desktop; sidebar collapses to a slide-in drawer (hamburger toggle, Escape closes) on screens ≤ 768px. `refreshTick` state is incremented on upload and passed to `DocumentList` as `refreshTrigger` to force a refetch.
 
+Sidebar Settings section contains two runtime-mutable toggles (`enable_numeric_ann`, `enable_cross_encoder`) and a separate **LLM provider** section: provider dropdown (Local / Anthropic / OpenAI), masked API-key input shown only when a non-local provider is picked, and a Save button. The header badge (`.llm-badge`) shows the active LLM — `activeProvider` state is decoupled from the form state and only updates on Save, so the badge never claims a provider whose key hasn't been persisted.
+
 ### `src/components/ChatWindow.tsx`
 
-Manages the message list, mode-pill state, and abort. On send: appends user + empty assistant messages; calls `streamChat(..., mode)` with handlers that mutate the last message in state; mode pills are disabled while streaming. Includes the upload component in the composer; a "Stop" button replaces "Send" while busy.
+Manages the message list, mode-pill state, and abort. On send: appends user + empty assistant messages; calls `streamChat(..., mode, getLLMConfig())` with handlers that mutate the last message in state; mode pills are disabled while streaming. `getLLMConfig()` is read per send, so toggling provider in the sidebar takes effect immediately on the next message. Includes the upload component in the composer; a "Stop" button replaces "Send" while busy.
 
 ### `src/components/MessageBubble.tsx`
 
@@ -673,10 +689,13 @@ CSS variables for the dark palette, grid layout, mobile drawer, table rendering 
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/health` | Returns chunk counts by type, inverted postings, file list, flags. |
+| `GET` | `/settings` | Returns `{enable_numeric_ann, enable_cross_encoder}` snapshot. |
+| `PATCH` | `/settings` | Mutates either flag at runtime. Body: `{enable_numeric_ann?, enable_cross_encoder?}`. |
+| `GET` | `/llm/local` | Returns the local LLM the backend falls back to: `{provider: "ollama", model}`. Used by the frontend badge when no cloud key is set. |
 | `GET` | `/documents` | Lists ingested documents with type and chunk count. |
 | `DELETE` | `/documents/{filename}` | Removes a doc + all its chunks across the four sub-stores. |
 | `POST` | `/ingest` | Multipart file upload → parse → chunk → embed → index. PDFs additionally extract tables as CSV and ingest each. |
-| `POST` | `/chat` | SSE stream of `{event: sources \| confidence \| token \| chart \| done}`. Body: `{session_id, message, mode}` where mode ∈ `auto, chat, aggregate, query`. |
+| `POST` | `/chat` | SSE stream of `{event: sources \| confidence \| token \| chart \| done}`. Body: `{session_id, message, mode, llm?}` where mode ∈ `auto, chat, aggregate, query` and `llm` is optional `{provider, api_key, model?}`. With `llm`, generation is routed to the named cloud provider; without it, local Ollama is used. |
 
 ---
 
@@ -774,6 +793,15 @@ The SSE parser strips one leading space (per spec) from `data:` values. `trimSta
 **Local LLMs over-call tools.**
 Don't register a tool and assume the system prompt will prevent it from being called. Gate at the request level: don't send `tools=...` to Ollama unless the message warrants it.
 
+**Cloud-LLM API key travels in the `/chat` request body.**
+On localhost / Vite proxy this is fine — no network egress. If you ever expose the backend over a real network, terminate TLS in front of it; HTTP would leak the key. The backend never persists the key (not in logs, not in SQLite, not on disk) — but it is briefly held in the Python process during the `stream_chat` call, so anything that snapshots the process (debugger, error reporter, memory dump) could see it.
+
+**Cloud failures don't fall back silently.**
+If the user has selected a cloud provider and the call fails (invalid key, rate limit, network), `router.stream_chat` lets the exception propagate. `/chat`'s try/except surfaces it as a `Model error: ...` token. We don't silently retry on the local model — that would mask configuration mistakes and produce confusing answers (different model, different quality).
+
+**`rewrite_query` always uses local Ollama.**
+Even when chat generation is routed to a cloud provider, query rewriting still hits the local model. Rationale: rewriting runs on every turn and burns tokens on a non-user-visible step; spending cloud tokens on it isn't worth the marginal quality lift. Side effect: if Ollama isn't running, rewriting silently falls back to the original message (its existing error path) — chat generation against the cloud still works.
+
 **Re-uploading a file appends duplicate chunks.**
 `ingest_file` always assigns a new `file_id`. Use the delete button before re-uploading the same file, or run `migrate_v2` to wipe-and-rebuild from `data/uploads/`. For multi-sheet Excel files, each sheet is a separate sidebar entry — delete each before re-uploading.
 
@@ -837,7 +865,11 @@ Change `embed_model` in `.env`. Update `text_dim` in `backend/app/state.py` to m
 
 ### Swap the LLM
 
-Change `OLLAMA_MODEL` in `.env` to any model in `ollama list` (pull it first with `ollama pull <model>`). Models differ in tool-calling quality — Qwen 2.5 7B is materially better than Mistral 7B at emitting structured tool calls; Llama 3.x also works.
+**Local (Ollama):** change `OLLAMA_MODEL` in `.env` to any model in `ollama list` (pull it first with `ollama pull <model>`). Models differ in tool-calling quality — Qwen 2.5 7B is materially better than Mistral 7B at emitting structured tool calls; Llama 3.x also works.
+
+**Cloud:** users toggle this per session from the sidebar **LLM provider** section — provider (Anthropic / OpenAI) + API key. The key is stored only in browser `localStorage` (keys: `fundlenz_llm_provider`, `fundlenz_llm_api_key`), sent in the `/chat` request body, and never touched by the backend persistence layer. To change the default cloud model, edit `ANTHROPIC_DEFAULT_MODEL` in `app/llm/anthropic_client.py` or `OPENAI_DEFAULT_MODEL` in `app/llm/openai_client.py`, then update `PROVIDER_DEFAULT_MODELS` in `frontend/src/api/client.ts` so the badge stays in sync.
+
+**Add a new cloud provider:** create `app/llm/<provider>_client.py` exposing `async def stream_chat(messages, tools=None, *, api_key, model=None) -> AsyncIterator[dict]` that yields the same `{"type": "token" | "tool_call", ...}` event shape. Add a branch in `app/llm/router.py::stream_chat`, extend `LLMProvider` and `PROVIDER_DEFAULT_MODELS` in `frontend/src/api/client.ts`, and add an `<option>` to the provider dropdown in `App.tsx`. Tool-schema conversion (if the provider doesn't accept OpenAI's format) belongs inside the new client module.
 
 ### Persist chat history across restarts
 
